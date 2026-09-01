@@ -22,6 +22,42 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Two-Factor Authentication
+    |--------------------------------------------------------------------------
+    |
+    | Off by default. An additional factor layered on top of whichever
+    | auth_driver is active — not a driver itself. Add Laravel\Fortify\
+    | TwoFactorAuthenticatable to your User model to use it.
+    |
+    */
+
+    'two_factor' => [
+        'enabled' => env('USARRS_2FA_ENABLED', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Passkeys (WebAuthn)
+    |--------------------------------------------------------------------------
+    |
+    | Off by default. An additional credential type layered on top of
+    | whichever auth_driver is active — not a driver itself. Add
+    | Laravel\Passkeys\PasskeyAuthenticatable and implement
+    | Laravel\Passkeys\Contracts\PasskeyUser on your User model to use it.
+    |
+    | When enabled, Passkeys' own JSON API routes (/passkeys/login,
+    | /user/passkeys/*) are left registered — they're WebAuthn-ceremony
+    | endpoints usarrs' own UI calls via JS, not a competing login/register
+    | page the way Fortify's routes are. When disabled, they're suppressed.
+    |
+    */
+
+    'passkeys' => [
+        'enabled' => env('USARRS_PASSKEYS_ENABLED', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Invites
     |--------------------------------------------------------------------------
     */

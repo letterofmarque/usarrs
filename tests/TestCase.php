@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Marque\Usarrs\Tests;
 
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Laravel\Fortify\FortifyServiceProvider;
+use Laravel\Passkeys\PasskeysServiceProvider;
 use Livewire\LivewireServiceProvider;
 use Marque\Ise\IseServiceProvider;
 use Marque\Trove\TroveServiceProvider;
@@ -21,6 +23,12 @@ abstract class TestCase extends BaseTestCase
             LivewireServiceProvider::class,
             TroveServiceProvider::class,
             IseServiceProvider::class,
+            // FortifyServiceProvider is registered explicitly here (not by
+            // usarrs' own composer.json alone) so the test suite proves usarrs
+            // actively suppresses Fortify's routes, not merely that Fortify
+            // was never installed to begin with.
+            FortifyServiceProvider::class,
+            PasskeysServiceProvider::class,
             UsarrsServiceProvider::class,
         ];
     }
@@ -39,6 +47,15 @@ abstract class TestCase extends BaseTestCase
         $app['config']->set('trove.user_model', TestUser::class);
         $app['config']->set('usarrs.layout', 'usarrs-test::layouts.app');
         $app['config']->set('auth.providers.users.model', TestUser::class);
+
+        // Passkeys' own config default (env('PASSKEYS_USER_HANDLE_SECRET',
+        // config('app.key'))) is evaluated when its config file is merged
+        // during PasskeysServiceProvider::register() — which runs before this
+        // method sets app.key above, so the default resolves to null in this
+        // harness. Set explicitly rather than relying on load order.
+        $app['config']->set('passkeys.user_handle_secret', 'test-secret');
+        $app['config']->set('passkeys.relying_party_id', 'localhost');
+        $app['config']->set('passkeys.allowed_origins', ['http://localhost']);
 
         $app['view']->addNamespace('usarrs-test', __DIR__.'/views');
     }

@@ -6,16 +6,21 @@ namespace Marque\Usarrs;
 
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
+use Laravel\Fortify\Fortify;
+use Laravel\Passkeys\Passkeys;
 use Marque\Usarrs\Contracts\InviteServiceInterface;
 use Marque\Usarrs\Livewire\Admin\UserIndex;
 use Marque\Usarrs\Livewire\Admin\UserShow;
 use Marque\Usarrs\Livewire\Auth\Login;
 use Marque\Usarrs\Livewire\Auth\Register;
+use Marque\Usarrs\Livewire\Auth\TwoFactorChallenge;
 use Marque\Usarrs\Livewire\Invite\InviteCreate;
 use Marque\Usarrs\Livewire\Invite\InviteIndex;
 use Marque\Usarrs\Livewire\Profile\AnnounceKeyManagement;
 use Marque\Usarrs\Livewire\Profile\Edit;
+use Marque\Usarrs\Livewire\Profile\PasskeyManagement;
 use Marque\Usarrs\Livewire\Profile\Show;
+use Marque\Usarrs\Livewire\Profile\TwoFactorSetup;
 use Marque\Usarrs\Models\Invite;
 use Marque\Usarrs\Policies\InvitePolicy;
 use Marque\Usarrs\Policies\UserPolicy;
@@ -28,6 +33,26 @@ class UsarrsServiceProvider extends ServiceProvider
         $this->mergeConfigFrom(__DIR__.'/../config/usarrs.php', 'usarrs');
 
         $this->app->bind(InviteServiceInterface::class, InviteService::class);
+
+        // usarrs is the only thing allowed to register /login, /register, and
+        // the rest of the auth surface. Fortify is used as an action library
+        // (2FA, passkeys) — never as usarrs' front door. Called here in
+        // register(), not boot(), because Fortify's own service provider reads
+        // this flag during its boot() to decide whether to bind its routes.
+        // Unconditional: this is what actually closes job #10583 — a Fortify
+        // route reachable underneath usarrs' own auth_driver checks.
+        Fortify::ignoreRoutes();
+
+        // Unlike Fortify, Passkeys' own routes are pure WebAuthn-ceremony JSON
+        // endpoints (/passkeys/login, /user/passkeys/*) with no usarrs
+        // equivalent to collide with — they're left registered when the
+        // feature is on, since usarrs' own UI calls them directly via JS.
+        // Suppressed when the feature is off so nothing is exposed at all.
+        if (! config('usarrs.passkeys.enabled', false)) {
+            Passkeys::ignoreRoutes();
+        } else {
+            Passkeys::useUserModel(config('trove.user_model', 'App\\Models\\User'));
+        }
     }
 
     public function boot(): void
@@ -72,9 +97,12 @@ class UsarrsServiceProvider extends ServiceProvider
     {
         \Livewire\Livewire::component('usarrs-login', Login::class);
         \Livewire\Livewire::component('usarrs-register', Register::class);
+        \Livewire\Livewire::component('usarrs-two-factor-challenge', TwoFactorChallenge::class);
         \Livewire\Livewire::component('usarrs-profile-show', Show::class);
         \Livewire\Livewire::component('usarrs-profile-edit', Edit::class);
         \Livewire\Livewire::component('usarrs-announce-key-management', AnnounceKeyManagement::class);
+        \Livewire\Livewire::component('usarrs-two-factor-setup', TwoFactorSetup::class);
+        \Livewire\Livewire::component('usarrs-passkey-management', PasskeyManagement::class);
         \Livewire\Livewire::component('usarrs-admin-user-index', UserIndex::class);
         \Livewire\Livewire::component('usarrs-admin-user-show', UserShow::class);
         \Livewire\Livewire::component('usarrs-invite-index', InviteIndex::class);
