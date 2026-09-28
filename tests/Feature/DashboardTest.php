@@ -5,11 +5,15 @@ declare(strict_types=1);
 // Spec #118: the dashboard assembles panels other packages register. usarrs
 // owns the page; it does not own most of what appears on it.
 //
-// At this Checkpoint usarrs registers NO panels of its own, which is what makes
-// the zero-panels case below honest rather than contrived.
+// This file runs with no tracker bound and usarrs' own features at their
+// shipped defaults (two-factor, passkeys and invites all off), so no panel
+// applies to the user — which is what makes the zero-panels case below honest
+// rather than contrived. The tracker-bound half is Feature/TrackerBound;
+// usarrs' own panels are DashboardUsarrsPanelsTest.
 
 use Livewire\Component as LivewireComponent;
 use Livewire\Livewire;
+use Marque\Trove\Contracts\TrackerStatsInterface;
 use Marque\Trove\Registry\DashboardPanel;
 use Marque\Trove\Registry\DashboardPanelRegistry;
 use Marque\Usarrs\Tests\TestUser;
@@ -30,6 +34,17 @@ beforeEach(function () {
     });
 });
 
+// CP3: usarrs registers the tracker panels only when a tracker is bound. This
+// TestCase binds none, so neither may appear — the bound half is in
+// Feature/TrackerBound, which needs the binding in place before boot.
+test('no tracker panels register when no tracker is bound', function () {
+    $registry = app(DashboardPanelRegistry::class);
+
+    expect(app()->bound(TrackerStatsInterface::class))->toBeFalse()
+        ->and($registry->find('usarrs-tracker-stats'))->toBeNull()
+        ->and($registry->find('usarrs-announce-key'))->toBeNull();
+});
+
 test('dashboard requires authentication', function () {
     $this->get(route('dashboard.index'))->assertRedirect();
 });
@@ -44,8 +59,12 @@ test('authenticated user can view the dashboard', function () {
 // existed, which makes the route table install-dependent — route('dashboard.index')
 // safe on one install and fatal on another, so every consumer linking to it
 // would need a Route::has() guard.
-test('the route is registered even with no panels at all', function () {
-    expect(app(DashboardPanelRegistry::class)->all())->toBeEmpty();
+//
+// usarrs always registers its own panels (CP4), so "no panels" means none that
+// apply to this user — the shipped default, with two-factor, passkeys and
+// invites all off and no tracker bound.
+test('the route is registered even with no panel visible to the user', function () {
+    expect(app(DashboardPanelRegistry::class)->visibleTo($this->user))->toBeEmpty();
 
     expect(fn () => route('dashboard.index'))->not->toThrow(Exception::class);
 

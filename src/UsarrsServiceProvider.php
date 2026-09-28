@@ -9,9 +9,13 @@ use Illuminate\Support\ServiceProvider;
 use Laravel\Fortify\Fortify;
 use Laravel\Passkeys\Passkeys;
 use Livewire\Livewire;
+use Marque\Trove\Contracts\TrackerStatsInterface;
+use Marque\Trove\Contracts\UserInterface;
 use Marque\Trove\Enums\Role;
 use Marque\Trove\Registry\AdminScreen;
 use Marque\Trove\Registry\AdminScreenRegistry;
+use Marque\Trove\Registry\DashboardPanel;
+use Marque\Trove\Registry\DashboardPanelRegistry;
 use Marque\Trove\Registry\NavItem;
 use Marque\Trove\Registry\NavRegistry;
 use Marque\Usarrs\Contracts\InviteServiceInterface;
@@ -21,7 +25,11 @@ use Marque\Usarrs\Livewire\Auth\Login;
 use Marque\Usarrs\Livewire\Auth\PasswordConfirm;
 use Marque\Usarrs\Livewire\Auth\Register;
 use Marque\Usarrs\Livewire\Auth\TwoFactorChallenge;
+use Marque\Usarrs\Livewire\Dashboard\AnnounceKeyPanel;
 use Marque\Usarrs\Livewire\Dashboard\Index as DashboardIndex;
+use Marque\Usarrs\Livewire\Dashboard\InvitesPanel;
+use Marque\Usarrs\Livewire\Dashboard\SecurityPanel;
+use Marque\Usarrs\Livewire\Dashboard\TrackerStatsPanel;
 use Marque\Usarrs\Livewire\Invite\InviteCreate;
 use Marque\Usarrs\Livewire\Invite\InviteIndex;
 use Marque\Usarrs\Livewire\Profile\AnnounceKeyManagement;
@@ -83,6 +91,7 @@ class UsarrsServiceProvider extends ServiceProvider
         $this->registerPolicies();
         $this->registerNavItems();
         $this->registerAdminScreens();
+        $this->registerDashboardPanels();
 
         if (class_exists(Livewire::class)) {
             if ($manageAuth) {
@@ -154,6 +163,87 @@ class UsarrsServiceProvider extends ServiceProvider
     }
 
     /**
+     * Declare the tracker panels on the user dashboard.
+     *
+     * usarrs renders them, but only when a tracker is bound: that is the one
+     * capability check, answered by the tracker rather than inferred here
+     * (Spec #119). Not ratio_mode — nothing reads it (job #10732), and the
+     * figures are the same in every mode. Not "is bloodhound installed" either;
+     * usarrs names no tracker.
+     *
+     * Asked in boot() and safe to ask there: a tracker binds in its own
+     * register(), and every provider's register() runs before any boot().
+     *
+     * Whether THIS user has anything to show is per-request, so it lives in the
+     * visibility closures.
+     */
+    protected function registerDashboardPanels(): void
+    {
+        $registry = $this->app->make(DashboardPanelRegistry::class);
+
+        $this->registerOwnDashboardPanels($registry);
+
+        if (! $this->app->bound(TrackerStatsInterface::class)) {
+            return;
+        }
+
+        $registry->register(new DashboardPanel(
+            identifier: 'usarrs-tracker-stats',
+            label: 'Tracker Stats',
+            component: 'usarrs-dashboard-tracker-stats',
+            position: 10,
+            visible: fn (?object $user): bool => $user instanceof UserInterface
+                && app(TrackerStatsInterface::class)->statsFor($user) !== null,
+        ));
+
+        $registry->register(new DashboardPanel(
+            identifier: 'usarrs-announce-key',
+            label: 'Announce Key',
+            component: 'usarrs-dashboard-announce-key',
+            position: 20,
+            visible: fn (?object $user): bool => $user instanceof UserInterface
+                && config('usarrs.profile.show_announce_key', true)
+                && app(TrackerStatsInterface::class)->announceKeyFor($user) !== null,
+        ));
+    }
+
+    /**
+     * The panels for data usarrs owns outright: account security and invites.
+     *
+     * Two-factor, passkeys and invites are each switched on by config, and
+     * usarrs already reads those flags per request — TwoFactorSetup,
+     * PasskeyManagement and InviteIndex all check in mount(). The panels read
+     * them the same way, from their visibility closures, rather than freezing
+     * a second answer at boot.
+     *
+     * manage_auth is decided at boot like the rest of the auth surface. The
+     * security panel reports Fortify's two-factor columns and usarrs' passkeys,
+     * which a fully custom auth implementation has replaced — so under
+     * manage_auth=false it would be describing the wrong system. Invites are
+     * not auth and register either way.
+     */
+    protected function registerOwnDashboardPanels(DashboardPanelRegistry $registry): void
+    {
+        if (config('usarrs.manage_auth', true)) {
+            $registry->register(new DashboardPanel(
+                identifier: 'usarrs-security',
+                label: 'Account Security',
+                component: 'usarrs-dashboard-security',
+                position: 30,
+                visible: fn (?object $user): bool => SecurityPanel::appliesTo($user),
+            ));
+        }
+
+        $registry->register(new DashboardPanel(
+            identifier: 'usarrs-invites',
+            label: 'Invites',
+            component: 'usarrs-dashboard-invites',
+            position: 40,
+            visible: fn (?object $user): bool => InvitesPanel::appliesTo($user),
+        ));
+    }
+
+    /**
      * Declare usarrs' navigation entries.
      *
      * The shell used to add Profile itself after detecting usarrs, and to render
@@ -165,6 +255,17 @@ class UsarrsServiceProvider extends ServiceProvider
     protected function registerNavItems(): void
     {
         $registry = $this->app->make(NavRegistry::class);
+
+        // The dashboard route exists on every install (Spec #118), so the link
+        // is always safe to render. First, because it is the page that answers
+        // "how am I doing" — the natural place for a signed-in user to start.
+        $registry->register(new NavItem(
+            identifier: 'usarrs-dashboard',
+            label: 'Dashboard',
+            route: 'dashboard.index',
+            position: 5,
+            visible: fn (?object $user): bool => $user !== null,
+        ));
 
         $registry->register(new NavItem(
             identifier: 'usarrs-profile',
@@ -209,6 +310,10 @@ class UsarrsServiceProvider extends ServiceProvider
     protected function registerNonAuthLivewireComponents(): void
     {
         Livewire::component('usarrs-dashboard-index', DashboardIndex::class);
+        Livewire::component('usarrs-dashboard-tracker-stats', TrackerStatsPanel::class);
+        Livewire::component('usarrs-dashboard-announce-key', AnnounceKeyPanel::class);
+        Livewire::component('usarrs-dashboard-security', SecurityPanel::class);
+        Livewire::component('usarrs-dashboard-invites', InvitesPanel::class);
         Livewire::component('usarrs-profile-show', Show::class);
         Livewire::component('usarrs-profile-edit', Edit::class);
         Livewire::component('usarrs-announce-key-management', AnnounceKeyManagement::class);
