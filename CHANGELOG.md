@@ -7,9 +7,69 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
-## [Unreleased]
+## [8.1.0] — 2026-10-01
 
-> The dashboard gets its panels — tracker stats, announce key, account security and invites — plus a nav entry, and other packages can contribute panels of their own.
+> Security: OAuth sign-in no longer signs in whoever has the email the provider reports, and password, magic-link and OAuth sign-in all go through the two-factor challenge; plus the dashboard gets its panels.
+
+### Security
+
+- **OAuth sign-in matched accounts by email — account takeover.** The socialite
+  callback looked up the account whose email the provider reported and signed it in,
+  creating one if nobody matched. Anyone able to get a configured provider to report
+  an address here — the admin's included — was signed in as that account, with no
+  two-factor challenge, under any registration setting, and unverified. OAuth
+  identities are now stored (`usarrs_social_accounts`) and a sign-in resolves only
+  through that stored connection. An unconnected identity whose email matches an
+  account (ignoring case) emails *that account's own address* a signed, single-use
+  link to connect them, instead of signing anyone in. The link opens a page naming the
+  provider account; nothing connects until the holder confirms there, so a mail
+  scanner following links connects nothing. (Spec #142, #10818)
+- **An account made under someone else's address stayed theirs.** OAuth could create
+  an unverified account for an address its creator didn't own; when the real owner
+  later connected their own provider from that inbox, the creator kept their way in.
+  Confirming a connection now verifies the address and, for an account OAuth made,
+  removes everything it gained before it was proven — other provider connections,
+  passkeys, two-factor, remembered sign-ins — and ends its open sessions by rotating the
+  password hash under `auth.session` — Livewire actions in an already-open tab included.
+  Needs your `User` model to implement `MustVerifyEmail`. Accounts from before 8.1 have
+  no stored connection, so they're verified but keep their 2FA, passkeys and sessions:
+  that protects existing users on upgrade, and means an account squatted *before* 8.1
+  keeps what was attached (see the README).
+- **Changing an account's email kept it verified.** Switching to your own inbox,
+  verifying, and switching back left an account "verified" under someone else's
+  address. A changed email now un-verifies the account and sends the new address a
+  verification mail. Addresses must now be unique ignoring case, on the profile page and
+  `/register` — PostgreSQL and SQLite let `Victim@` sit beside `victim@` (and a clash on
+  the profile page was a 500).
+- **An unverified account could connect another provider** — a way back in that
+  outlived the owner taking the account over. Now refused until the address is verified.
+- **The connection email rendered the provider's display name as markdown**, so a
+  name like `[Reset your password](https://…)` became a live link in this site's own
+  mail. It also identified the provider account by that name and the recipient's own
+  email — nothing an attacker couldn't copy. It now shows the provider's handle and
+  id, as plain text.
+- **One invite could create several accounts.** Concurrent sign-ups carrying the same
+  invite all redeemed it. The invite is now claimed in one conditional write, in the
+  same transaction as the account (and, for OAuth, its connection), on `/register`
+  and the OAuth callback alike.
+- **The OAuth callback told anyone which addresses have accounts** when registration
+  was closed: "we've sent a link" for a known one, "registration is closed" for an
+  unknown one. Both now get the same answer.
+- **Magic-link sign-in skipped two-factor.** A user with 2FA confirmed who followed a
+  magic link was signed straight in. Every login usarrs performs — password, magic
+  link, OAuth, straight after registering — now finishes through one place that applies
+  the challenge. Passkey sign-in (`laravel/passkeys`' own endpoint, when enabled) is the
+  exception: it asks for no TOTP code afterwards, a passkey being a phishing-resistant
+  factor already.
+- **`socialite` mode wasn't OAuth-only.** Only the form was hidden: password login,
+  password registration, password reset and magic-link tokens all still worked. They
+  are now refused on the server. Passkeys, if you've enabled them, still work
+  alongside OAuth. (#10802)
+- **The OAuth routes existed under every driver**, gated only on
+  `socialite_providers` (default `['github']`). They now exist only under `socialite`.
+- **A signed-in user completing OAuth could be switched into another account**, or
+  have a new one created. It now connects the provider to their own account, and
+  refuses one that's connected elsewhere.
 
 ### Added
 
@@ -27,12 +87,62 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 - **A Dashboard navigation entry** (`usarrs-dashboard`, position 5) for signed-in users.
   Apps rendering deck's navigation gain the link with no change on their side.
 
+- **OAuth accounts follow the registration rules.** One `RegistrationRules` answer is
+  shared by `/register` and the OAuth callback: no account where registration is
+  closed or a required invite is missing. Send an invite through the redirect —
+  `/auth/github/redirect?invite=CODE`. New OAuth accounts are unverified and sent the
+  verification email.
+- The profile page now shows flashed status and error messages (where connecting a
+  provider lands).
+
 ### Changed
 
+- **usarrs' signed-in routes and the OAuth routes carry `auth.session`**, and every
+  sign-in records the password hash it was made under, so a changed hash ends the
+  session everywhere. `AuthenticateSession` is added to Livewire's persistent middleware,
+  so it covers component actions too. A user who changes their password on the profile
+  page stays signed in there and is signed out of their other sessions. Where
+  `laravel/passkeys`' own routes are registered, they carry it too.
+- **`InviteService::redeem()` throws `Marque\Usarrs\Exceptions\InviteAlreadyRedeemed`**
+  when the invite is no longer pending and unexpired in the database — used, revoked or
+  expired since it was looked up. It used to overwrite whatever was there. The
+  interface signature is unchanged; call it inside the transaction that creates the
+  account, and catch it.
+- **Magic-link verification only works under the `magic_link` driver.** It accepted
+  any password-reset token under every driver and signed the user in.
+- **Password reset only exists under `password` and `invite_only`** — what
+  `AuthDriver::supportsPasswordReset()` always declared and nothing enforced. Under
+  `magic_link` and `socialite` the reset routes are 404s.
 - `/profile/stats` renders its figures and announce key from two shared partials,
   `usarrs::partials.tracker-figures` and `usarrs::partials.announce-key`, which the dashboard
   panels use too. Output is unchanged. A previously published `profile/stats.blade.php` keeps
   working as-is.
+
+### Upgrading
+
+- **Run `php artisan migrate`** — adds `usarrs_social_accounts`.
+- **socialite sites:** existing OAuth users have no stored connection yet. The first
+  time each signs in with OAuth they're emailed a link to connect it; they confirm on
+  the page it opens, and every sign-in after goes straight through. Make sure mail works
+  before upgrading. The email names the provider account asking to connect — **tell
+  your users to expect it, and to ignore one naming an account that isn't theirs.**
+  `laravel/socialite` is still required (it was never a hard dependency).
+- **If you call `InviteService::redeem()` yourself**, catch `InviteAlreadyRedeemed` (see
+  Changed).
+- **Add `auth.session` to your app's own signed-in routes**
+  (`Route::middleware(['auth', 'auth.session'])`). usarrs ends a squatter's sessions
+  through it; routes without it are left open to them.
+- **Passkeys: known issue (#10883).** On recent Fortify (1.39 at least) the passkey
+  endpoints aren't registered at all, so passkeys don't work — leave them off for now.
+  Not new in 8.1; found while hardening this release.
+- **Use a shared, persistent cache store** — pending OAuth connections live there
+  between the email and the confirmation. `array`, or `file` across several servers,
+  breaks every link.
+- **OAuth on a non-socialite site stops working.** If you relied on the OAuth routes
+  being live alongside `password`, they're gone — that combination was never
+  documented and is what let the takeover reach every install.
+- **`password`-driver sites whose users followed magic links**, or **`magic_link` /
+  `socialite` sites using password reset**, will now get 404s on those routes.
 
 ## [8.0.0] — 2026-09-25
 

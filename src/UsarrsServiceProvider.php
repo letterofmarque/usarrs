@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Marque\Usarrs;
 
+use Illuminate\Auth\Events\Login as LoginEvent;
+use Illuminate\Session\Middleware\AuthenticateSession;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Fortify\Fortify;
@@ -18,9 +21,13 @@ use Marque\Trove\Registry\DashboardPanel;
 use Marque\Trove\Registry\DashboardPanelRegistry;
 use Marque\Trove\Registry\NavItem;
 use Marque\Trove\Registry\NavRegistry;
+use Marque\Usarrs\Auth\SocialiteOAuthProvider;
 use Marque\Usarrs\Contracts\InviteServiceInterface;
+use Marque\Usarrs\Contracts\OAuthProvider;
+use Marque\Usarrs\Listeners\StampSessionPasswordHash;
 use Marque\Usarrs\Livewire\Admin\UserIndex;
 use Marque\Usarrs\Livewire\Admin\UserShow;
+use Marque\Usarrs\Livewire\Auth\ConfirmOAuthLink;
 use Marque\Usarrs\Livewire\Auth\Login;
 use Marque\Usarrs\Livewire\Auth\PasswordConfirm;
 use Marque\Usarrs\Livewire\Auth\Register;
@@ -50,6 +57,10 @@ class UsarrsServiceProvider extends ServiceProvider
 
         $this->app->bind(InviteServiceInterface::class, InviteService::class);
 
+        // Socialite behind a seam usarrs owns (Spec #142): only
+        // SocialiteOAuthProvider names Socialite, and tests swap in a fake.
+        $this->app->bind(OAuthProvider::class, SocialiteOAuthProvider::class);
+
         // usarrs is the only thing allowed to register /login, /register, and
         // the rest of the auth surface. Fortify is used as an action library
         // (2FA, passkeys) — never as usarrs' front door. Called here in
@@ -68,11 +79,31 @@ class UsarrsServiceProvider extends ServiceProvider
             Passkeys::ignoreRoutes();
         } else {
             Passkeys::useUserModel(config('trove.user_model', 'App\\Models\\User'));
+
+            // Their routes carry their own middleware, which never included
+            // auth.session: a session ended everywhere else by a rotated
+            // password hash could still register a passkey here — a way back
+            // in past the inbox proof (CP #784). Set before their routes load
+            // at boot; a guest (the login routes) passes straight through.
+            config(['passkeys.middleware' => array_values(array_unique([
+                ...(array) config('passkeys.middleware', ['web']),
+                'auth.session',
+            ]))]);
         }
     }
 
     public function boot(): void
     {
+        // Every sign-in records the password hash it signed in under, so
+        // auth.session can end it if that hash rotates (CP #776).
+        Event::listen(LoginEvent::class, StampSessionPasswordHash::class);
+
+        // Livewire re-applies a route's middleware to its component updates
+        // only from a fixed list, which names Jetstream's AuthenticateSession
+        // but not Laravel's. Without this, a tab opened before the hash
+        // rotated kept working — every action in it (CP #777).
+        Livewire::addPersistentMiddleware([AuthenticateSession::class]);
+
         // manage_auth is the one-way escape hatch (Spec #92): routes/auth.php
         // is usarrs' entire login/register/2FA-challenge/password-reset/
         // magic-link/socialite/logout surface, and it's skipped outright when
@@ -304,6 +335,7 @@ class UsarrsServiceProvider extends ServiceProvider
         Livewire::component('usarrs-two-factor-setup', TwoFactorSetup::class);
         Livewire::component('usarrs-passkey-management', PasskeyManagement::class);
         Livewire::component('usarrs-password-confirm', PasswordConfirm::class);
+        Livewire::component('usarrs-confirm-oauth-link', ConfirmOAuthLink::class);
     }
 
     // Profile, invites, admin — unaffected by manage_auth in either state.

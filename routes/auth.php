@@ -3,11 +3,13 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Route;
+use Marque\Usarrs\Enums\AuthDriver;
 use Marque\Usarrs\Http\Controllers\EmailVerificationController;
 use Marque\Usarrs\Http\Controllers\LogoutController;
 use Marque\Usarrs\Http\Controllers\MagicLinkController;
 use Marque\Usarrs\Http\Controllers\PasswordResetController;
 use Marque\Usarrs\Http\Controllers\SocialiteController;
+use Marque\Usarrs\Livewire\Auth\ConfirmOAuthLink;
 use Marque\Usarrs\Livewire\Auth\Login;
 use Marque\Usarrs\Livewire\Auth\PasswordConfirm;
 use Marque\Usarrs\Livewire\Auth\Register;
@@ -55,14 +57,29 @@ Route::middleware(config('usarrs.middleware', ['web']))
         Route::get('auth/magic-link/sent', [MagicLinkController::class, 'showSentPage'])->name('magic-link.sent');
         Route::get('auth/magic-link/verify', [MagicLinkController::class, 'verify'])->name('magic-link.verify');
 
-        // Socialite — the callbacks double as account linking for a user who
-        // is already signed in.
-        Route::get('auth/{provider}/redirect', [SocialiteController::class, 'redirect'])->name('socialite.redirect');
-        Route::get('auth/{provider}/callback', [SocialiteController::class, 'callback'])->name('socialite.callback');
+        // Socialite — only under socialite mode (Spec #142). These used to be
+        // registered under every mode and gated only on socialite_providers,
+        // which defaults to ['github'], so a password-mode install had a live
+        // OAuth door it never chose. The callbacks double as account linking
+        // for a user who is already signed in.
+        if (AuthDriver::from(config('usarrs.auth_driver', 'password')) === AuthDriver::Socialite) {
+            // auth.session: a signed-in session whose password hash has rotated
+            // under it — a squatter's, once the owner proved the inbox — is
+            // ended here, not allowed to connect another provider (CP #776).
+            Route::get('auth/{provider}/redirect', [SocialiteController::class, 'redirect'])->middleware('auth.session')->name('socialite.redirect');
+            Route::get('auth/{provider}/callback', [SocialiteController::class, 'callback'])->middleware('auth.session')->name('socialite.callback');
+
+            // The emailed "connect this account?" link — signed and expiring.
+            // It opens a page naming the provider account; connecting is a
+            // deliberate action there, and works once (Spec #142, CP #762).
+            Route::get('auth/{provider}/link/{token}', ConfirmOAuthLink::class)
+                ->middleware('signed')
+                ->name('socialite.link.confirm');
+        }
     });
 
 // Logout (requires auth)
-Route::middleware(config('usarrs.auth_middleware', ['web', 'auth']))
+Route::middleware([...config('usarrs.auth_middleware', ['web', 'auth']), 'auth.session'])
     ->prefix(config('usarrs.prefix', ''))
     ->group(function () {
         Route::post('logout', LogoutController::class)->name('logout');
@@ -72,7 +89,7 @@ Route::middleware(config('usarrs.auth_middleware', ['web', 'auth']))
 // names, paths, and the {id}/{hash} param shape are fixed by core Laravel's
 // own Illuminate\Auth\Notifications\VerifyEmail, which hardcodes
 // 'verification.verify' — not usarrs' choice to make.
-Route::middleware(config('usarrs.auth_middleware', ['web', 'auth']))
+Route::middleware([...config('usarrs.auth_middleware', ['web', 'auth']), 'auth.session'])
     ->prefix(config('usarrs.prefix', ''))
     ->group(function () {
         Route::get('email/verify', [EmailVerificationController::class, 'notice'])

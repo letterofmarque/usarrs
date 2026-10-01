@@ -7,7 +7,8 @@ for the [Marque](https://github.com/letterofmarque/marque) tracker platform.
 reset, magic links, OAuth (Socialite), logout, session handling, role-based access
 control, invites, and the admin user panel. It requires
 [`laravel/fortify`](https://github.com/laravel/fortify) as a hard dependency and
-uses its action classes for two-factor authentication and WebAuthn passkeys — but
+uses its action classes for two-factor authentication (passkeys come from
+[`laravel/passkeys`](https://github.com/laravel/passkeys)) — but
 `usarrs` is always the only thing that registers `/login`, `/register`, and the rest
 of the auth surface. Fortify's own routes are never reachable
 (`Fortify::ignoreRoutes()` is called unconditionally, regardless of any other
@@ -66,15 +67,16 @@ audiences:
 | Config key | Default | Applies to |
 |---|---|---|
 | `guest_middleware` | `['web', 'guest']` | login, register, 2FA challenge, forgot-password |
-| `middleware` | `['web']` | reset-password, magic-link, socialite callbacks |
+| `middleware` | `['web']` | reset-password, magic-link, OAuth redirect/callback/confirm |
 | `auth_middleware` | `['web', 'auth']` | logout, profile, email verification, password confirm |
 
 The middle row is the one worth understanding. Those routes are **not**
 guest-gated on purpose: an authenticated user can legitimately follow a
 password-reset link that arrived by email, click a magic link issued on
-another device, or complete an OAuth callback to link an additional provider.
-Gating them would break all three, which is why `guest` is applied to the
-genuinely guest-only routes rather than to the whole group.
+another device, or complete an OAuth round trip to connect a provider to their
+account (see [OAuth](#oauth-the-socialite-driver)). Gating them would break all
+three, which is why `guest` is applied to the genuinely guest-only routes rather
+than to the whole group. Each still only exists under the driver it belongs to.
 
 Override any of them by publishing the config. If you point `guest_middleware`
 at a custom stack, keep a `guest`-equivalent in it or logged-in users will see
@@ -89,9 +91,14 @@ a time:
 | Driver | What it enables | What it disables |
 |---|---|---|
 | `password` | Email + password login and registration | — |
-| `magic_link` | Passwordless email-only login. A link is emailed on request; visiting it logs the user in | The password field on login; password-based registration still creates an account, but sign-*in* afterwards is link-only |
-| `socialite` | OAuth provider buttons only (`config('usarrs.socialite_providers')`, default `['github']`) | Email/password login and registration entirely — the only way in is an OAuth provider |
+| `magic_link` | Passwordless email-only login. A link is emailed on request; visiting it logs the user in | Password login and password reset; password-based registration still creates an account, but sign-*in* afterwards is link-only |
+| `socialite` | OAuth sign-in, via the providers in `config('usarrs.socialite_providers')` (default `['github']`) — plus passkeys, if you've enabled them (see [Passkeys](#passkeys-webauthn)). Requires `composer require laravel/socialite` | Password login, password registration, password reset and magic links — refused on the server, not just hidden. See [OAuth](#oauth-the-socialite-driver) |
 | `invite_only` | Password login | Public registration — `GET /register` 404s. New accounts are created only via a redeemed invite (see Invites below) |
+
+Each driver's routes only exist under that driver: the OAuth routes only under
+`socialite`, magic-link verification only under `magic_link`, and password reset
+only under `password` and `invite_only`. A route that belongs to another driver is
+a 404, not a hidden form.
 
 **Every driver's `GET /login`, `GET /register` etc. are usarrs' own routes.**
 Fortify's independently-registered equivalents are suppressed unconditionally
@@ -104,6 +111,67 @@ Fortify with its own routes active by default — installing one alongside usarr
 just having Fortify present for its 2FA/passkey actions, used to leave that second
 front door open. See the [manage_auth](#manage_auth-escape-hatch) section below for
 the full opt-out story.
+
+## OAuth (the socialite driver)
+
+An OAuth sign-in is matched to an account by the **provider's own user id**, stored
+in `usarrs_social_accounts` when the two are connected — never by email. A provider
+reporting someone's email address does not make you that someone.
+
+| Someone completes OAuth and… | What happens |
+|---|---|
+| the identity is connected to an account | signed in to that account — through the two-factor challenge if they have 2FA on |
+| it isn't connected, but its email matches an account here (ignoring case) | nobody is signed in. That account's own address is emailed a link, valid 60 minutes and good once. The email and the page it opens name the provider account; nothing is connected until the holder presses **Connect** there, which then signs them in (2FA applies). Opening the link alone — or a mail scanner opening it — does nothing |
+| it isn't connected and matches no account | an account is created **only if registration is open** — the same rules as `/register`, including required invites — then it's sent the verification email and signed in. Where registration is closed, the visitor gets the same answer whether or not the address has an account, so the callback can't be used to probe which addresses exist |
+| they're already signed in | the identity is connected to *their* account. One that's connected to someone else is refused; they are never switched into another account |
+
+**Invites with OAuth:** there's no registration form under this driver, so send the
+invite through the redirect — `/auth/github/redirect?invite=CODE`. An invite is
+claimed in the same transaction that creates the account, so two sign-ups racing on
+one invite get one account between them.
+
+**Connecting proves the address.** An account made by OAuth starts unverified: a
+provider *reporting* an address isn't proof of owning it. So someone could make an
+account under an address that isn't theirs, before its owner does. When the owner
+later confirms a connection from that address's inbox, usarrs marks the address
+verified and — because OAuth made the account — removes everything it gained before
+then: other provider connections, passkeys, two-factor, remembered sign-ins, and any
+open session (its password hash is rotated; see below). This needs your `User` model to
+implement `MustVerifyEmail` (see
+[Email Verification](#email-verification--password-confirmation)).
+
+What it can't do is tell an old account from a squatted one. Accounts made before 8.1
+— by OAuth, or by `/register` under another driver before a switch to `socialite` —
+have no stored connection, and they're verified on confirmation but **keep** their 2FA,
+passkeys and sessions. That protects every existing user's own setup on upgrade day; the
+cost is that an account somebody squatted *before* 8.1 keeps what they attached. (Before
+8.1 a squatter didn't need to: the callback signed anyone in by email.) If you have
+reason to doubt an old account, an admin can reset its 2FA and passkeys.
+
+An account whose address isn't verified can't connect another provider, and changing
+an account's email on the profile page un-verifies it and sends the new address a
+verification mail. Addresses are unique ignoring case, on the profile page and `/register`
+alike.
+
+**Put `auth.session` on your own signed-in routes.** Ending an open session works
+through Laravel's `AuthenticateSession` middleware (`auth.session`), which signs out
+a session whose password hash has changed underneath it. usarrs puts it on its own
+signed-in routes and the OAuth routes, adds it to Livewire's persistent middleware (so
+it also guards component actions in a tab that was already open), and records the hash
+at every sign-in so no session escapes it. Routes your app defines need it too —
+`Route::middleware(['auth', 'auth.session'])` — or a squatter can keep using them.
+
+**The cache must be shared and persistent.** A pending connection is held in the
+default cache store between the email and the confirmation. With the `array` store,
+or a per-server `file` store behind a load balancer, every link reads as "already
+used or expired".
+
+**Upgrading from before 8.1:** existing OAuth accounts have no stored connection yet.
+The first time each of those users signs in with OAuth, they're emailed the
+connection link above; they confirm on the page it opens, and every sign-in after
+that goes straight through. The email names the provider account asking to connect,
+so tell your users to expect it — and to ignore one naming an account that isn't
+theirs.
 
 ## Email Verification & Password Confirmation
 
@@ -166,7 +234,19 @@ an additive credential type, not a driver. Uses
 Unlike Fortify, Passkeys' own routes (`/passkeys/login`, `/user/passkeys/*`) are
 left registered when this feature is on — they're WebAuthn-ceremony JSON endpoints
 with no usarrs equivalent to collide with, called directly by usarrs' own UI via JS.
-They're suppressed when the feature is off.
+They're suppressed when the feature is off, and carry `auth.session` when it's on.
+
+> **Known issue (#10883):** recent Fortify releases (1.39 at least) suppress
+> `laravel/passkeys`' routes in order to serve their own — and usarrs suppresses
+> Fortify's. On those versions the passkey endpoints exist nowhere, so passkey
+> registration and sign-in don't work. Leave passkeys off until this is fixed.
+
+**Passkey sign-in is the one login usarrs doesn't finish itself.** Every other way in
+— password, magic link, OAuth, straight after registering — ends in one place that
+applies the two-factor challenge. A passkey signs in through `laravel/passkeys`' own
+endpoint, under every driver including `socialite`, and asks for no TOTP code
+afterwards: a passkey is already a phishing-resistant factor, so a code on top adds
+little. If you want `socialite` to mean OAuth and nothing else, leave passkeys off.
 
 ## `manage_auth` Escape Hatch
 

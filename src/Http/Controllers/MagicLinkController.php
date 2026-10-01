@@ -6,8 +6,9 @@ namespace Marque\Usarrs\Http\Controllers;
 
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
 use Illuminate\View\View;
+use Marque\Usarrs\Auth\LoginCompletion;
+use Marque\Usarrs\Enums\AuthDriver;
 
 class MagicLinkController
 {
@@ -19,6 +20,11 @@ class MagicLinkController
 
     public function verify(Request $request): RedirectResponse
     {
+        // Only in magic_link mode. The token is a password-broker token, so
+        // this endpoint used to sign in anyone holding a reset link under every
+        // mode — including socialite, which is meant to be OAuth only (Spec #142).
+        abort_unless(AuthDriver::from(config('usarrs.auth_driver', 'password')) === AuthDriver::MagicLink, 404);
+
         $request->validate([
             'token' => 'required',
             'email' => 'required|email',
@@ -34,9 +40,8 @@ class MagicLinkController
 
         app('auth.password.broker')->deleteToken($user);
 
-        Auth::login($user, remember: true);
-        session()->regenerate();
-
-        return redirect('/');
+        // Through the seam, so a user with 2FA confirmed is challenged. This
+        // path used to sign them straight in (Spec #142).
+        return redirect(app(LoginCompletion::class)->begin($user, remember: true));
     }
 }
