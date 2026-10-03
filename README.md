@@ -82,6 +82,29 @@ Override any of them by publishing the config. If you point `guest_middleware`
 at a custom stack, keep a `guest`-equivalent in it or logged-in users will see
 the login form again.
 
+### Banned, disabled and pending users
+
+A user whose `status` is anything but `active` can't sign in, and is signed out
+if they already are:
+
+- **Every sign-in path refuses them.** Password, magic link, OAuth and the
+  two-factor challenge all finish in one place, which turns an inactive user
+  back to the login form with the reason ("This account has been banned.").
+  Ways in that don't pass through it, like passkey sign-in or a remember-me
+  cookie, are caught on Laravel's `Login` event and get a 403.
+- **A live session ends on its next request**, on any page in the `web`
+  middleware group and not just usarrs' own. usarrs pushes
+  `EnsureUserIsActive` onto that group, so a ban covers browsing and
+  downloading everywhere. It also covers Livewire actions from a tab that was
+  already open.
+
+Only the three statuses usarrs defines as inactive are refused: `banned`,
+`disabled` and `pending`. usarrs adds the `status` column only if your app
+doesn't already have one. If yours does, it can hold whatever your app
+means by it (`enabled`, `1`, your own enum), and none of that is treated as
+a ban. A user with no status at all is never refused. bloodhound's announce
+check refuses the same three values, plus an `enabled` column set to false.
+
 ## Auth Driver
 
 `config('usarrs.auth_driver')` controls the top-level login/registration flow. Set
@@ -93,7 +116,7 @@ a time:
 | `password` | Email + password login and registration | — |
 | `magic_link` | Passwordless email-only login. A link is emailed on request; visiting it logs the user in | Password login and password reset; password-based registration still creates an account, but sign-*in* afterwards is link-only |
 | `socialite` | OAuth sign-in, via the providers in `config('usarrs.socialite_providers')` (default `['github']`) — plus passkeys, if you've enabled them (see [Passkeys](#passkeys-webauthn)). Requires `composer require laravel/socialite` | Password login, password registration, password reset and magic links — refused on the server, not just hidden. See [OAuth](#oauth-the-socialite-driver) |
-| `invite_only` | Password login | Registration of any kind — `GET /register` 404s, and no route creates an account. Invites don't open it yet (#10801): for invite-gated sign-up, use `password` with `invites.required` |
+| `invite_only` | Password login, and registration through an invite | Open sign-up: `GET /register` is a 404 unless it carries a valid, unused, unexpired invite (`/register?invite=CODE`, the link in the invite email). Needs `invites.enabled` so members can create invites |
 
 Each driver's routes only exist under that driver: the OAuth routes only under
 `socialite`, magic-link verification only under `magic_link`, and password reset
@@ -205,6 +228,28 @@ class User extends Authenticatable implements MustVerifyEmail
 }
 ```
 
+**Every new account is sent the verification email**, whether it came from
+`/register` or the OAuth callback. Both fire Laravel's `Registered` event, so
+your app can hook new accounts. A stock Laravel 11+ app already listens for that
+event with `SendEmailVerificationNotification`; when that listener is
+registered, usarrs leaves the sending to it, and only sends the mail itself when
+the listener is absent. Either way the user gets exactly one mail.
+
+**What needs a verified address.** An account nobody has proven the address of
+may be a squatter's, and anything it attaches outlives the real owner taking the
+account back. So by default an unverified account can't:
+
+| Action | Where it's refused |
+|---|---|
+| Add a passkey | `verified` middleware on `/user/passkeys/options` and `POST /user/passkeys` |
+| Turn on two-factor authentication | `TwoFactorSetup` (enable and confirm) |
+| Connect an OAuth provider while signed in | the OAuth callback |
+| Create an invite | `/invites/create` redirects to `verification.notice`; the action refuses too |
+| Get an announce key | the Generate/Regenerate action. bloodhound also holds the key back at sign-up and issues it on verification |
+
+An app whose `User` doesn't implement `MustVerifyEmail` has opted out of
+verification, and none of these checks apply to it.
+
 Password confirmation needs no opt-in trait — it works against any authenticated user
 out of the box.
 
@@ -223,6 +268,43 @@ Uses Fortify's own TOTP action classes (`EnableTwoFactorAuthentication`,
 and `TwoFactorChallenge` (login-time) Livewire components. To use it, your `User`
 model needs `Laravel\Fortify\TwoFactorAuthenticatable`.
 
+### Rate limits
+
+| Where | Limit | Keyed on |
+|---|---|---|
+| Password login | 5 a minute | email (case-folded) and IP |
+| Two-factor challenge | 5 a minute, codes and recovery codes together | the pending login |
+| Password confirmation | 5 a minute | the signed-in user |
+
+Each attempt is counted before the answer is checked, as an atomic increment.
+Checking first and counting only failures would let a burst of parallel
+requests through before any of them was counted. A successful attempt resets
+the count.
+
+The challenge limit isn't keyed on IP. Anyone at the challenge already has the
+password, and an IP key would let them switch addresses to get five more guesses.
+
+**The trade-off is that limits can be used to lock people out.**
+
+- Someone who has a user's password can keep that user out of the two-factor
+  challenge, recovery codes included, for as long as they keep guessing.
+- Someone holding a hijacked session can do the same to password confirmation.
+- Password login is keyed on email and IP. If your app sits behind a proxy
+  you haven't configured `TrustProxies` for, every visitor shares one IP, and
+  anyone can lock any account out of password login. Configure trusted proxies.
+
+Ten invites a member can email per hour is a limit too: see [Invites](#invites).
+
+**A TOTP code works once.** usarrs keeps the timestamp of each user's last
+accepted code and only accepts a newer one. That way a code seen over someone's
+shoulder or in a log can't be reused while it's still valid. Fortify's own
+provider keys this on the code alone, so two users who happen to share a code
+block each other. usarrs keys it per user.
+
+The limits and the used-code record live in your app's cache store. A cache
+that doesn't persist between requests, such as the `array` driver, turns both
+off.
+
 ## Passkeys (WebAuthn)
 
 Off by default (`config('usarrs.passkeys.enabled')`, `USARRS_PASSKEYS_ENABLED`). Also
@@ -232,15 +314,37 @@ an additive credential type, not a driver. Uses
 `Laravel\Passkeys\PasskeyAuthenticatable` and must implement
 `Laravel\Passkeys\Contracts\PasskeyUser`.
 
-Unlike Fortify, Passkeys' own routes (`/passkeys/login`, `/user/passkeys/*`) are
-left registered when this feature is on — they're WebAuthn-ceremony JSON endpoints
-with no usarrs equivalent to collide with, called directly by usarrs' own UI via JS.
-They're suppressed when the feature is off, and carry `auth.session` when it's on.
+**usarrs registers the passkey endpoints itself**, using `laravel/passkeys`'
+own controllers, paths and route names:
 
-> **Known issue (#10883):** recent Fortify releases (1.39 at least) suppress
-> `laravel/passkeys`' routes in order to serve their own — and usarrs suppresses
-> Fortify's. On those versions the passkey endpoints exist nowhere, so passkey
-> registration and sign-in don't work. Leave passkeys off until this is fixed.
+| Route name | Path | Middleware (plus `web`, `auth.session`) |
+|---|---|---|
+| `passkey.login-options` | `GET /passkeys/login/options` | `guest`, `throttle:usarrs-passkeys` |
+| `passkey.login` | `POST /passkeys/login` | `guest`, `throttle:usarrs-passkeys` |
+| `passkey.confirm-options` | `GET /passkeys/confirm/options` | `auth`, `throttle:usarrs-passkeys` |
+| `passkey.confirm` | `POST /passkeys/confirm` | `auth`, `throttle:usarrs-passkeys` |
+| `passkey.registration-options` | `GET /user/passkeys/options` | `auth`, `verified`, `password.confirm`, `throttle:usarrs-passkeys` |
+| `passkey.store` | `POST /user/passkeys` | `auth`, `verified`, `password.confirm`, `throttle:usarrs-passkeys` |
+| `passkey.destroy` | `DELETE /user/passkeys/{passkey}` | `auth`, `password.confirm` |
+
+`usarrs-passkeys` is a named limiter, so it doesn't share a bucket with the
+app's other throttled routes. It allows 10 requests a minute per user, or per
+IP for guests, which is five sign-ins (options, then the assertion). Removing
+a passkey from the profile page also asks for a confirmed password, as the
+`DELETE` endpoint does. When adding one needs a confirmed password first, the
+page sends the user to confirm it and then returns them.
+
+While usarrs manages auth, `laravel/passkeys` is never allowed to register them. This works the same on
+every Fortify version usarrs allows (`^1.30`). Fortify 1.39 suppresses
+`laravel/passkeys`' routes to serve its own, and usarrs suppresses Fortify's, so
+until this was fixed the endpoints existed nowhere and passkeys didn't work at all (#10883).
+They're absent when passkeys are off. With `manage_auth` false, usarrs
+registers none of them and leaves `laravel/passkeys` to register its own (or
+Fortify to suppress them, as 1.39 does).
+
+With passkeys on, the login page shows **Sign in with a passkey** under every
+driver. A passkey sign-in lands on `/`, like every other usarrs sign-in, and a
+banned or inactive user's passkey is refused (422) before any session exists.
 
 **Passkey sign-in is the one login usarrs doesn't finish itself.** Every other way in
 — password, magic link, OAuth, straight after registering — ends in one place that
@@ -280,9 +384,21 @@ using it.
 ],
 ```
 
-Independent of `auth_driver`. For an invite-gated tracker, use the `password` driver
-with `invites.enabled` and `invites.required`: `/register` then needs a valid invite.
-`invite_only` currently closes registration entirely, invites included (#10801).
+Two ways to run an invite-gated tracker:
+
+- **`auth_driver=invite_only`** with `invites.enabled`. `/register` doesn't exist
+  for anyone without an invite: it's a 404 unless the request carries a valid one.
+  This is the fully closed shape.
+- **`auth_driver=password`** with `invites.enabled` and `invites.required`. The
+  form is visible to everyone but won't create an account without a valid invite.
+
+An invite created with a recipient address is emailed **to that address**, with a
+`/register?invite=CODE` link (under `usarrs.prefix` if you set one). A member can
+email at most ten invites an hour. Without that, creating, revoking and creating
+again would let anyone send this site's invite email to any address, as often as
+they liked. Any valid invite presented at registration is used
+up, whether or not `invites.required` is on, and the same applies to an OAuth
+sign-up that carries one.
 
 ## Dashboard
 

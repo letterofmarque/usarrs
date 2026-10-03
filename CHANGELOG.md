@@ -7,6 +7,83 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [8.2.0] — 2026-10-03
+
+> Security: banned users are refused everywhere, sign-in and the two-factor challenge are rate-limited, and adding passkeys, two-factor, invites or announce keys needs a verified address; passkeys now work on current Fortify, and invite_only lets invites in.
+
+### Security
+
+- **Banned users could still sign in.** `EnsureUserIsActive` existed but nothing
+  registered it, and no sign-in path checked `status`. So a banned, disabled or
+  pending user signed in normally by every route, and an existing session kept
+  working. Now the login seam refuses them with the reason, a `Login` listener
+  refuses the paths that skip the seam (passkeys, remember-me), and the middleware
+  is pushed onto the `web` group so a live session ends on its next request to any
+  page. Only `banned`, `disabled` and `pending` refuse: an app's own `status` column
+  can mean anything, so any other value, or no status at all, is left alone.
+- **Nothing was rate-limited.** The two-factor challenge accepted unlimited guesses
+  per pending login, so a 6-digit code could be brute-forced in hours. A code could
+  also be reused inside its window, and password login and password confirmation
+  were unthrottled. Now each is limited to five a minute: password login per email
+  and IP, the challenge per pending login (codes and recovery codes together), and
+  confirmation per user. Each attempt is counted before it's checked, atomically,
+  so parallel bursts can't get past the count. A TOTP code works once per user,
+  including one from the next time step, and including two requests racing with
+  the same code.
+- **An unverified account could add passkeys and two-factor, create invites, and
+  hold an announce key.** Profile, security and invite routes sat behind `auth`, not
+  `verified`. Each of those actions now needs a verified address, as connecting an
+  OAuth provider already did. An app whose `User` doesn't implement
+  `MustVerifyEmail` is unaffected. Pair this with bloodhound's matching change,
+  which holds a new user's key back until verification.
+
+### Fixed
+
+- **Password registration never sent the verification email.** The new account was
+  signed in, met the `verified` middleware, and got no mail until the user found
+  "resend". `/register` and the OAuth callback now both fire `Registered` and send
+  exactly one verification email: usarrs leaves it to Laravel's
+  `SendEmailVerificationNotification` listener when the app registers one, and
+  sends it itself otherwise. The OAuth path didn't fire `Registered` before.
+- **`invite_only` made invites unusable.** `/register` returned a 404 before reading the
+  invite code, and it was the only place an invite was redeemed, so under
+  `invite_only` no account could be created by any route. Now a valid invite opens
+  the form (`/register?invite=CODE`), and anything else still gets the 404.
+- **Invites were only used up when `invites.required` was on.** With invites merely
+  enabled, an invite stayed pending after someone joined with it. Any valid invite
+  presented at registration is now redeemed.
+- **The invite email went to the member who created the invite, not the person
+  invited.** It now goes to the recipient address. It also no longer reads the dead
+  `id.app_name` config key.
+- **The invite link ignored `usarrs.prefix`**, so on a prefixed install it led to a
+  404. Members can now email at most ten invites an hour.
+- **After confirming a password, users landed on `/`** instead of the page that
+  asked them to confirm.
+- **Removing a passkey from the profile page skipped password confirmation**, which
+  the `DELETE` endpoint requires. When adding a passkey needs a confirmed password,
+  the page now sends the user to confirm it and brings them back, instead of failing
+  with a script error.
+- **Passkeys didn't work on current Fortify.** Fortify 1.39 suppresses `laravel/passkeys`'
+  routes in order to serve its own, and usarrs suppresses Fortify's, so the WebAuthn
+  endpoints existed nowhere. Registering a passkey failed and passkey sign-in didn't
+  exist. usarrs now registers those endpoints itself, with `laravel/passkeys`'
+  controllers, paths and names, on any Fortify version. They carry `auth.session`,
+  `verified` and `password.confirm` for adding, and a named `usarrs-passkeys`
+  throttle (Fortify had replaced laravel/passkeys' throttle with nothing). With
+  `manage_auth` off, usarrs leaves laravel/passkeys to register its own. Also fixed: a passkey sign-in landed on Fortify's
+  `/home` instead of `/`; the profile page's passkey script parsed the wrong part of
+  the options response; and the passkey user model was reset by Fortify.
+
+### Added
+
+- **Sign in with a passkey** on the login page, when passkeys are enabled.
+- **A Generate announce key button** for a user who has no key. Previously the key
+  section simply didn't render, so such a user had no way to get one. It shows only
+  to a verified address and isn't subject to `allow_announce_key_regen`, because
+  that switch is about replacing a key, not getting a first one.
+- A banned or inactive user's passkey is refused (422) through `laravel/passkeys`'
+  login authorization hook, before any session exists.
+
 ## [8.1.0] — 2026-10-01
 
 > Security: OAuth sign-in no longer signs in whoever has the email the provider reports, and password, magic-link and OAuth sign-in all go through the two-factor challenge; plus the dashboard gets its panels.

@@ -5,9 +5,12 @@ declare(strict_types=1);
 namespace Marque\Usarrs;
 
 use Illuminate\Auth\Events\Login as LoginEvent;
+use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Http\Request;
 use Illuminate\Session\Middleware\AuthenticateSession;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Fortify\Fortify;
 use Laravel\Passkeys\Passkeys;
@@ -24,6 +27,9 @@ use Marque\Trove\Registry\NavRegistry;
 use Marque\Usarrs\Auth\SocialiteOAuthProvider;
 use Marque\Usarrs\Contracts\InviteServiceInterface;
 use Marque\Usarrs\Contracts\OAuthProvider;
+use Marque\Usarrs\Enums\UserStatus;
+use Marque\Usarrs\Http\Middleware\EnsureUserIsActive;
+use Marque\Usarrs\Listeners\RefuseInactiveLogin;
 use Marque\Usarrs\Listeners\StampSessionPasswordHash;
 use Marque\Usarrs\Livewire\Admin\UserIndex;
 use Marque\Usarrs\Livewire\Admin\UserShow;
@@ -70,25 +76,16 @@ class UsarrsServiceProvider extends ServiceProvider
         // route reachable underneath usarrs' own auth_driver checks.
         Fortify::ignoreRoutes();
 
-        // Unlike Fortify, Passkeys' own routes are pure WebAuthn-ceremony JSON
-        // endpoints (/passkeys/login, /user/passkeys/*) with no usarrs
-        // equivalent to collide with — they're left registered when the
-        // feature is on, since usarrs' own UI calls them directly via JS.
-        // Suppressed when the feature is off so nothing is exposed at all.
-        if (! config('usarrs.passkeys.enabled', false)) {
+        // While usarrs manages auth, laravel/passkeys never registers its own
+        // routes: usarrs registers the same endpoints in routes/auth.php, with
+        // its own middleware. Left to themselves they were at the mercy of
+        // whichever Fortify was installed. Fortify 1.39 suppresses them to
+        // serve its own, which usarrs suppresses in turn, so the endpoints
+        // existed nowhere (#10883). With manage_auth off, routes/auth.php isn't
+        // loaded, so laravel/passkeys keeps its own when passkeys are on (Job
+        // #141 review), and nothing is exposed when they're off.
+        if (config('usarrs.manage_auth', true) || ! config('usarrs.passkeys.enabled', false)) {
             Passkeys::ignoreRoutes();
-        } else {
-            Passkeys::useUserModel(config('trove.user_model', 'App\\Models\\User'));
-
-            // Their routes carry their own middleware, which never included
-            // auth.session: a session ended everywhere else by a rotated
-            // password hash could still register a passkey here — a way back
-            // in past the inbox proof (CP #784). Set before their routes load
-            // at boot; a guest (the login routes) passes straight through.
-            config(['passkeys.middleware' => array_values(array_unique([
-                ...(array) config('passkeys.middleware', ['web']),
-                'auth.session',
-            ]))]);
         }
     }
 
@@ -97,6 +94,15 @@ class UsarrsServiceProvider extends ServiceProvider
         // Every sign-in records the password hash it signed in under, so
         // auth.session can end it if that hash rotates (CP #776).
         Event::listen(LoginEvent::class, StampSessionPasswordHash::class);
+
+        // A banned user is refused however they sign in, and a live session
+        // ends on its next request to any web page, not just usarrs' (#10857).
+        Event::listen(LoginEvent::class, RefuseInactiveLogin::class);
+        $this->app['router']->pushMiddlewareToGroup('web', EnsureUserIsActive::class);
+
+        if (config('usarrs.passkeys.enabled', false)) {
+            $this->configurePasskeys();
+        }
 
         // Livewire re-applies a route's middleware to its component updates
         // only from a fixed list, which names Jetstream's AuthenticateSession
@@ -144,6 +150,30 @@ class UsarrsServiceProvider extends ServiceProvider
                 __DIR__.'/../database/migrations' => database_path('migrations'),
             ], 'usarrs-migrations');
         }
+    }
+
+    /**
+     * Set at boot, after Fortify's register() has rewritten laravel/passkeys'
+     * config to suit Fortify's own routes (#10883).
+     */
+    protected function configurePasskeys(): void
+    {
+        // Fortify resets this to the auth provider's model in its register().
+        Passkeys::useUserModel(config('trove.user_model', 'App\\Models\\User'));
+
+        // Its own bucket. An unnamed throttle keys on domain and IP, shared
+        // with every other unnamed throttle in the app (Job #141 review).
+        // Ten requests a minute is five sign-ins: options, then the assertion.
+        RateLimiter::for('usarrs-passkeys', fn (Request $request) => Limit::perMinute(10)
+            ->by('usarrs-passkeys|'.($request->user()?->getAuthIdentifier() ?? $request->ip())));
+
+        // A banned user's passkey signs no one in: refused with a 422 before
+        // any session exists. The Login listener stays as the backstop.
+        Passkeys::authorizeLoginUsing(fn ($request, $user) => UserStatus::refusalFor($user) === null);
+
+        // Where a passkey sign-in lands. Fortify sets this to its own home
+        // (/home); every other usarrs sign-in lands on the site root.
+        config(['passkeys.redirect' => '/']);
     }
 
     protected function registerPolicies(): void

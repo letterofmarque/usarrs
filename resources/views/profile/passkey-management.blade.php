@@ -22,38 +22,65 @@
     </div>
 
     <x-deck::button x-on:click="register">{{ __('Add a Passkey') }}</x-deck::button>
+    <x-deck::text class="text-sm text-red-600" x-show="error" x-text="error" x-cloak></x-deck::text>
 
-    {{-- The actual WebAuthn ceremony (navigator.credentials.create) talks
-         directly to Passkeys' own JSON endpoints (/user/passkeys/options,
-         /user/passkeys) — usarrs deliberately leaves those routes registered
-         (see UsarrsServiceProvider) rather than reimplementing them. This
-         script is the browser-side glue; it cannot be exercised by the
-         headless test suite (see PasskeyManagementTest.php's header comment)
-         and needs a manual or Playwright pass against a real browser. --}}
+    {{-- The browser side of the WebAuthn ceremony (navigator.credentials.create)
+         against laravel/passkeys' endpoints, which usarrs registers itself
+         (routes/auth.php, #10883). The suite drives those endpoints with a
+         software authenticator (PasskeyCeremonyTest); this script still needs a
+         real browser to exercise. --}}
     <script>
         function usarrsPasskeys() {
             return {
+                error: null,
+
                 async register() {
-                    const optionsResponse = await fetch('/user/passkeys/options');
-                    const options = await optionsResponse.json();
+                    this.error = null;
 
-                    const credential = await navigator.credentials.create({
-                        publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(options),
-                    });
+                    try {
+                        const optionsResponse = await fetch(@js($optionsUrl), {
+                            headers: { 'Accept': 'application/json' },
+                        });
 
-                    await fetch('/user/passkeys', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
-                        },
-                        body: JSON.stringify({
-                            name: prompt('{{ __('Name this passkey') }}', 'My Passkey'),
-                            credential: credential.toJSON(),
-                        }),
-                    });
+                        // 423: the password needs confirming first. Go and do
+                        // that, and come back here.
+                        if (optionsResponse.status === 423) {
+                            return this.$wire.requirePasswordConfirmation();
+                        }
 
-                    window.location.reload();
+                        const optionsData = await optionsResponse.json();
+
+                        if (! optionsResponse.ok) {
+                            throw new Error(optionsData.message);
+                        }
+
+                        const { options } = optionsData;
+
+                        const credential = await navigator.credentials.create({
+                            publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(options),
+                        });
+
+                        const response = await fetch(@js($storeUrl), {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json',
+                                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
+                            },
+                            body: JSON.stringify({
+                                name: prompt(@js(__('Name this passkey')), 'My Passkey') || 'My Passkey',
+                                credential: credential.toJSON(),
+                            }),
+                        });
+
+                        if (! response.ok) {
+                            throw new Error((await response.json()).message);
+                        }
+
+                        window.location.reload();
+                    } catch (e) {
+                        this.error = e.message || @js(__('The passkey could not be added.'));
+                    }
                 },
             };
         }
