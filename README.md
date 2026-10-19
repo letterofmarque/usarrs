@@ -97,6 +97,11 @@ if they already are:
   `EnsureUserIsActive` onto that group, so a ban covers browsing and
   downloading everywhere. It also covers Livewire actions from a tab that was
   already open.
+- **An API token is refused too.** The same check runs in the `api` group,
+  ordered after authentication, so a token route such as cennad's
+  (`['api', 'auth:api']`) answers 403 with the reason. Nothing is revoked:
+  reinstate the user and the same token works again. A route outside both
+  groups is not covered; put `EnsureUserIsActive` on it yourself.
 
 Only the three statuses usarrs defines as inactive are refused: `banned`,
 `disabled` and `pending`. usarrs adds the `status` column only if your app
@@ -118,10 +123,10 @@ a time:
 | `socialite` | OAuth sign-in, via the providers in `config('usarrs.socialite_providers')` (default `['github']`) — plus passkeys, if you've enabled them (see [Passkeys](#passkeys-webauthn)). Requires `composer require laravel/socialite` | Password login, password registration, password reset and magic links — refused on the server, not just hidden. See [OAuth](#oauth-the-socialite-driver) |
 | `invite_only` | Password login, and registration through an invite | Open sign-up: `GET /register` is a 404 unless it carries a valid, unused, unexpired invite (`/register?invite=CODE`, the link in the invite email). Needs `invites.enabled` so members can create invites |
 
-Each driver's routes only exist under that driver: the OAuth routes only under
-`socialite`, magic-link verification only under `magic_link`, and password reset
-only under `password` and `invite_only`. A route that belongs to another driver is
-a 404, not a hidden form.
+The OAuth routes are registered only under `socialite`. Magic-link verification and
+password reset are registered under every driver, and answer 404 except under their
+own: magic links under `magic_link`, reset under `password` and `invite_only`. A route
+that belongs to another driver is a 404, not a hidden form.
 
 **Every driver's `GET /login`, `GET /register` etc. are usarrs' own routes.**
 Fortify's independently-registered equivalents are suppressed unconditionally
@@ -429,6 +434,30 @@ and its stats panel links through to it for the full page. Removing it would rem
 named route — a major version for usarrs and a broken deep link for anyone who bookmarked
 it — so in this version the two coexist. Whether it goes is a decision for later, once the
 dashboard has proven itself.
+
+### Seedboxes
+
+When a tracker keeps seedboxes (bloodhound binds trove's `SeedboxesInterface`), members
+manage theirs at **`/profile/seedboxes`**, linked from `/profile/stats`. They register an
+address or a range, see whether it is approved, and remove it. Admins approve and revoke
+at **`/admin/seedboxes`**, which is advertised to the admin panel. Approving is for
+admins only, not moderators, because an approved seedbox raises the speed limit its
+member's announces are held to.
+
+The tracker decides what a valid range is and what approval means. usarrs shows its
+answers, including its reason when it refuses a range. With no such tracker, both routes
+still exist (a link to them is never fatal) and answer 404, and nothing links to them.
+
+### Sessions
+
+When a tracker keeps live sessions (bloodhound binds trove's `TrackerSessionsInterface`),
+members see theirs at **`/profile/sessions`**, linked from `/profile/stats`: each torrent
+they are announcing, seeding or leeching, the client, the address and the last announce,
+leeching first and 50 to a page. **End** ends one. It is for a client that restarted
+somewhere else and is refused by the tracker's location limits while its old session is
+still live. The tracker decides what ending costs (bloodhound credits nothing the old
+session moved since its last announce) and refuses to end another member's. With no such
+tracker the route exists and answers 404, and nothing links to it.
 
 ## Requirements
 

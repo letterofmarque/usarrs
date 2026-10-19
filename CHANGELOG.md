@@ -7,6 +7,46 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [8.3.0] — 2026-10-20
+
+> Members manage their seedboxes and end their own tracker sessions, admins approve seedboxes, a banned member's API token is refused, and the magic-link mail states the link's real lifetime.
+
+### Added
+
+- **Seedbox screens.** When a tracker binds trove's `SeedboxesInterface` (bloodhound 8.0),
+  members register, view and remove their seedboxes at `/profile/seedboxes`, linked from
+  `/profile/stats`, and admins approve or revoke them at `/admin/seedboxes`, advertised to
+  the admin panel. Without such a tracker, both routes answer 404 and nothing links to
+  them. Requires the trove release that adds the contract.
+- **Sessions screen.** When a tracker binds trove's `TrackerSessionsInterface` (bloodhound
+  8.0), members see their live sessions at `/profile/sessions`, linked from
+  `/profile/stats`: torrent, seeding or leeching, client, address and last announce, 50 to
+  a page, with **End** on each. Ending one frees a client restarted somewhere else from the
+  tracker's location limits. Without such a tracker the route answers 404 and nothing
+  links to it.
+
+### Changed
+
+- **No longer requires `marque/threepio` directly.** Nothing in this package's code uses
+  it; it arrives through `marque/trove`, which does. So a threepio major no longer needs a
+  release of this package. The published versions' `threepio ^3.0` would have blocked
+  threepio 4.0, which bloodhound 8.0 requires. Nothing changes for an install.
+- **Requires `marque/trove` ^4.6**, for `TrackerSessionsInterface`.
+
+### Fixed
+
+- **A banned member's API token kept working** (#10920). A ban ended web sessions only:
+  cennad's routes are `['api', 'auth:api']`, and the `api` group never ran the check.
+  `EnsureUserIsActive` now runs in the `api` group too, ordered after authentication, and
+  answers a token route with a 403 and the reason. A token guard has no session or
+  logout, so nothing else happens; reinstating the member makes the same token work
+  again. Both registrations go through the HTTP kernel, so a later kernel change can't
+  silently drop them.
+- **The magic-link mail said the link lasts 15 minutes; it lasts the password broker's
+  expiry** (Laravel's default is 60), and now says so (#10839). It also named the site
+  from `id.app_name`, a key gone since `id` became `deck`; it reads `deck.app_name`, then
+  `app.name`.
+
 ## [8.2.1] — 2026-10-03
 
 > Ships what 8.2.0 should have contained: 8.2.0 reached Packagist without its last fix (manage_auth off no longer errors for unverified members) and its README corrections.

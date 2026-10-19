@@ -6,6 +6,9 @@ namespace Marque\Usarrs;
 
 use Illuminate\Auth\Events\Login as LoginEvent;
 use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Contracts\Auth\Middleware\AuthenticatesRequests;
+use Illuminate\Contracts\Http\Kernel as HttpKernel;
+use Illuminate\Foundation\Http\Kernel as FoundationHttpKernel;
 use Illuminate\Http\Request;
 use Illuminate\Session\Middleware\AuthenticateSession;
 use Illuminate\Support\Facades\Event;
@@ -15,6 +18,7 @@ use Illuminate\Support\ServiceProvider;
 use Laravel\Fortify\Fortify;
 use Laravel\Passkeys\Passkeys;
 use Livewire\Livewire;
+use Marque\Trove\Contracts\SeedboxesInterface;
 use Marque\Trove\Contracts\TrackerStatsInterface;
 use Marque\Trove\Contracts\UserInterface;
 use Marque\Trove\Enums\Role;
@@ -31,6 +35,7 @@ use Marque\Usarrs\Enums\UserStatus;
 use Marque\Usarrs\Http\Middleware\EnsureUserIsActive;
 use Marque\Usarrs\Listeners\RefuseInactiveLogin;
 use Marque\Usarrs\Listeners\StampSessionPasswordHash;
+use Marque\Usarrs\Livewire\Admin\SeedboxIndex;
 use Marque\Usarrs\Livewire\Admin\UserIndex;
 use Marque\Usarrs\Livewire\Admin\UserShow;
 use Marque\Usarrs\Livewire\Auth\ConfirmOAuthLink;
@@ -48,6 +53,8 @@ use Marque\Usarrs\Livewire\Invite\InviteIndex;
 use Marque\Usarrs\Livewire\Profile\AnnounceKeyManagement;
 use Marque\Usarrs\Livewire\Profile\Edit;
 use Marque\Usarrs\Livewire\Profile\PasskeyManagement;
+use Marque\Usarrs\Livewire\Profile\SeedboxManagement;
+use Marque\Usarrs\Livewire\Profile\SessionManagement;
 use Marque\Usarrs\Livewire\Profile\Show;
 use Marque\Usarrs\Livewire\Profile\TwoFactorSetup;
 use Marque\Usarrs\Models\Invite;
@@ -89,6 +96,40 @@ class UsarrsServiceProvider extends ServiceProvider
         }
     }
 
+    /**
+     * Run EnsureUserIsActive on every web and API request.
+     *
+     * The `api` group too (#10920): cennad's routes are ['api', 'auth:api'],
+     * and a ban that held on the web but not on a token would leave a banned
+     * member reading and writing through the API. On a token route the user
+     * is only known once the guard has run, so the check is ordered after
+     * authentication in the middleware priority; Laravel sorts a route's
+     * stack by it.
+     *
+     * Through the HTTP kernel rather than the router: any later kernel change
+     * re-syncs the router from the kernel's own lists, which would silently
+     * drop a group entry or a priority made on the router alone.
+     */
+    private function enforceActiveUsers(): void
+    {
+        $kernel = $this->app->make(HttpKernel::class);
+
+        if (! $kernel instanceof FoundationHttpKernel) {
+            $this->app['router']->pushMiddlewareToGroup('web', EnsureUserIsActive::class);
+            $this->app['router']->pushMiddlewareToGroup('api', EnsureUserIsActive::class);
+
+            return;
+        }
+
+        foreach (['web', 'api'] as $group) {
+            if (array_key_exists($group, $kernel->getMiddlewareGroups())) {
+                $kernel->appendMiddlewareToGroup($group, EnsureUserIsActive::class);
+            }
+        }
+
+        $kernel->addToMiddlewarePriorityAfter(AuthenticatesRequests::class, EnsureUserIsActive::class);
+    }
+
     public function boot(): void
     {
         // Every sign-in records the password hash it signed in under, so
@@ -98,7 +139,7 @@ class UsarrsServiceProvider extends ServiceProvider
         // A banned user is refused however they sign in, and a live session
         // ends on its next request to any web page, not just usarrs' (#10857).
         Event::listen(LoginEvent::class, RefuseInactiveLogin::class);
-        $this->app['router']->pushMiddlewareToGroup('web', EnsureUserIsActive::class);
+        $this->enforceActiveUsers();
 
         if (config('usarrs.passkeys.enabled', false)) {
             $this->configurePasskeys();
@@ -221,6 +262,22 @@ class UsarrsServiceProvider extends ServiceProvider
             group: 'Users',
             position: 10,
         ));
+
+        // Only where a tracker keeps seedboxes: the screen 404s otherwise. The
+        // tracker binds in its register(), which has run by now (boot).
+        if ($this->app->bound(SeedboxesInterface::class)) {
+            $registry->register(new AdminScreen(
+                identifier: 'usarrs-seedboxes',
+                label: 'Seedboxes',
+                component: 'usarrs-admin-seedbox-index',
+                path: 'admin/seedboxes',
+                // SeedboxIndex refuses anyone below admin.
+                minimumRole: Role::Admin,
+                icon: 'server',
+                group: 'Users',
+                position: 20,
+            ));
+        }
     }
 
     /**
@@ -381,6 +438,9 @@ class UsarrsServiceProvider extends ServiceProvider
         Livewire::component('usarrs-announce-key-management', AnnounceKeyManagement::class);
         Livewire::component('usarrs-admin-user-index', UserIndex::class);
         Livewire::component('usarrs-admin-user-show', UserShow::class);
+        Livewire::component('usarrs-admin-seedbox-index', SeedboxIndex::class);
+        Livewire::component('usarrs-seedbox-management', SeedboxManagement::class);
+        Livewire::component('usarrs-session-management', SessionManagement::class);
         Livewire::component('usarrs-invite-index', InviteIndex::class);
         Livewire::component('usarrs-invite-create', InviteCreate::class);
     }
