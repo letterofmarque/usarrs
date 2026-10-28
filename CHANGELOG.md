@@ -7,6 +7,60 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [9.0.0] — 2026-10-28
+
+> Staff are managed from above: only an owner manages admins and grants Admin or Owner, nobody acts on themselves, the last owner can't be demoted, and usarrs:owner sets the first.
+
+### Breaking
+
+- **Admins can no longer ban, unban or change the role of another admin, or of the
+  owner.** Before, any admin could demote or ban any other admin, the tracker's owner
+  included. Admins and owners are now managed by an owner alone, and only an owner grants
+  Admin or Owner. Nobody bans themselves or changes their own role. The last owner can't be
+  demoted (`AuthorizationException`).
+- **An admin can no longer revoke an admin's or the owner's invite.** An invite is revoked
+  by its creator, or by anyone who could manage the creator (`InvitePolicy::revoke`, which
+  the invites screen now uses).
+- **`InviteServiceInterface::revoke()` takes optional `actor` and `reason`.** An
+  implementation of the interface must accept them.
+- **Requires `marque/trove` ^5.0**, for `Role::Owner` and `StaffActionsInterface`.
+
+### Fixed
+
+- **Bans, unbans and role changes now save on a stock Laravel `User` model.** Laravel's
+  stock `User` lists its fillable attributes, and `role` and `status` aren't among them, so
+  `UserAdminService` writing them with `update()` silently did nothing: the admin screen
+  said the member was banned, and they weren't. Found by the new clean room (a real app
+  installed from scratch); the suite's own test user is unguarded and never saw it. They're
+  written with `forceFill()` now, and `usarrs:owner` reads the role back and fails if it
+  didn't save. Apps that call `Model::unguard()` were never affected.
+
+### Added
+
+- **`UserPolicy::setRole($user, $target, Role $role)` and `unban`.** `ban`, `unban`,
+  `promote` and `setRole` hold the rules above.
+- **Staff actions are recorded** through trove's `StaffActionsInterface`: a ban, an unban
+  and a role change made by an actor (`usarrs.user.banned`, `unbanned`, `role_changed`, with
+  the status or role before and after), and revoking someone else's invite
+  (`usarrs.invite.revoked`). With no store installed, nothing is kept. Recording happens
+  inside the change's transaction, so a change rolled back isn't recorded.
+- **`UserAdminService::ban()`, `unban()` and `setRole()` take optional `actor` and `reason`.** Given
+  one, they check `UserPolicy` against it, so code calling the service gets the same answers
+  as the screen. With no actor (app code, the console) the staff rules don't apply. The
+  last-owner rule holds either way. It locks the owner rows, so two owners demoting each
+  other at once can't leave nobody.
+- **`php artisan usarrs:owner {email}`** makes a user an owner. Only an owner grants
+  Admin, so a tracker with no owner can never make another admin. This sets the first.
+- The user screen offers only the roles the actor may give, hides Ban from those who may
+  not use it, refuses either when it's called directly (403), and answers 422 to a role
+  that doesn't exist.
+
+### Upgrading
+
+Run `php artisan usarrs:owner you@example.com` once after upgrading. Until someone is an
+owner, admins still manage users, uploaders and moderators, but nobody can grant or remove
+Admin.
+
 ## [8.6.2] — 2026-10-24
 
 > Verifying an email address lands on usarrs.home, not always on /.

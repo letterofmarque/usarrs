@@ -4,13 +4,31 @@ declare(strict_types=1);
 
 namespace Marque\Usarrs\Services;
 
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Contracts\Auth\Authenticatable;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Gate;
+use Marque\Trove\Contracts\StaffActionsInterface;
 use Marque\Trove\Enums\Role;
+use Marque\Trove\Support\StaffAction;
 use Marque\Usarrs\Enums\UserStatus;
 
+/**
+ * Banning members and changing their roles.
+ *
+ * Pass the acting staff member as `actor` and UserPolicy's rules apply: who
+ * may act on whom, and who may grant Admin or Owner. With no actor (app code,
+ * the console) they don't, because whoever calls without one is already
+ * trusted. The last owner can't be demoted either way.
+ */
 class UserAdminService
 {
+    public function __construct(
+        private readonly StaffActionsInterface $staffActions,
+    ) {}
+
     public function list(?string $search = null, ?string $role = null, ?string $status = null, int $perPage = 25): LengthAwarePaginator
     {
         $model = config('trove.user_model', 'App\\Models\\User');
@@ -26,18 +44,96 @@ class UserAdminService
             ->paginate($perPage);
     }
 
-    public function ban(Authenticatable $user): void
+    public function ban(Authenticatable $user, ?Authenticatable $actor = null, ?string $reason = null): void
     {
-        $user->update(['status' => UserStatus::Banned->value]);
+        $this->authorize($actor, 'ban', [$user]);
+
+        $this->setStatus($user, UserStatus::Banned, 'usarrs.user.banned', $actor, $reason);
     }
 
-    public function unban(Authenticatable $user): void
+    public function unban(Authenticatable $user, ?Authenticatable $actor = null, ?string $reason = null): void
     {
-        $user->update(['status' => UserStatus::Active->value]);
+        $this->authorize($actor, 'unban', [$user]);
+
+        $this->setStatus($user, UserStatus::Active, 'usarrs.user.unbanned', $actor, $reason);
     }
 
-    public function setRole(Authenticatable $user, Role $role): void
+    /**
+     * @throws AuthorizationException when the actor may not, or it would leave no owner
+     */
+    public function setRole(Authenticatable $user, Role $role, ?Authenticatable $actor = null, ?string $reason = null): void
     {
-        $user->update(['role' => $role->value]);
+        $this->authorize($actor, 'setRole', [$user, $role]);
+
+        DB::transaction(function () use ($user, $role, $actor, $reason): void {
+            $from = $user->role;
+
+            if ($user->role === Role::Owner && $role !== Role::Owner) {
+                // The owner rows themselves are locked, so two owners
+                // demoting each other at once can't both see the other still
+                // standing and leave nobody. Rows, not a count() query:
+                // PostgreSQL refuses FOR UPDATE on an aggregate.
+                $owners = $user->newQuery()
+                    ->where('role', Role::Owner->value)
+                    ->lockForUpdate()
+                    ->get([$user->getKeyName()]);
+
+                if ($owners->count() <= 1) {
+                    throw new AuthorizationException(
+                        'This is the last owner. Make someone else an owner before changing this role.',
+                    );
+                }
+            }
+
+            // forceFill, not update(): Laravel's stock User lists its fillable
+            // attributes and role isn't one, so update() drops it without a
+            // word. The clean room caught a role change that did nothing.
+            $user->forceFill(['role' => $role->value])->save();
+
+            // Inside the transaction, so an action rolled back is never
+            // recorded as having happened.
+            $this->record($actor, 'usarrs.user.role_changed', $user, $reason, [
+                'role' => ['from' => $from instanceof Role ? $from->value : $from, 'to' => $role->value],
+            ]);
+        });
+    }
+
+    protected function setStatus(Authenticatable $user, UserStatus $status, string $action, ?Authenticatable $actor, ?string $reason): void
+    {
+        DB::transaction(function () use ($user, $status, $action, $actor, $reason): void {
+            $from = $user->status;
+            // forceFill for the same reason: status isn't fillable on a stock
+            // User either, so a ban through update() never banned anyone.
+            $user->forceFill(['status' => $status->value])->save();
+
+            $this->record($actor, $action, $user, $reason, [
+                'status' => ['from' => $from instanceof UserStatus ? $from->value : $from, 'to' => $status->value],
+            ]);
+        });
+    }
+
+    /**
+     * Only when someone acted: app code and the console pass no actor, and
+     * nobody did anything to anybody.
+     *
+     * @param  array<string, array{from: scalar|null, to: scalar|null}>  $changes
+     */
+    protected function record(?Authenticatable $actor, string $action, Authenticatable $subject, ?string $reason, array $changes): void
+    {
+        if ($actor === null || ! $subject instanceof Model) {
+            return;
+        }
+
+        $this->staffActions->record(StaffAction::of($actor, $action, $subject, $reason, $changes));
+    }
+
+    /**
+     * @param  array<int, mixed>  $arguments
+     */
+    protected function authorize(?Authenticatable $actor, string $ability, array $arguments): void
+    {
+        if ($actor !== null) {
+            Gate::forUser($actor)->authorize($ability, $arguments);
+        }
     }
 }

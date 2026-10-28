@@ -379,6 +379,54 @@ whatever was built, recreating exactly the kind of route collision this flag exi
 to prevent. See the [upgrade guide](../../docs/upgrade-guide-usarrs-v6.md) before
 using it.
 
+## Roles and the owner
+
+Roles come from trove: user, uploader, moderator, admin, and owner above admin. An owner
+is an admin for every other purpose: `isAdmin()` is true for them.
+
+The user screen (`admin/users/{user}`, under `usarrs.prefix`) bans, unbans and changes roles
+under these rules:
+
+- **Admins manage users, uploaders and moderators.** They can ban them and move them
+  between those roles.
+- **Admins and owners are managed by an owner alone.** No admin can demote or ban another
+  admin, or the owner.
+- **Only an owner grants Admin or Owner.**
+- **Nobody changes their own role or bans themselves.**
+- **The last owner can't be demoted.** Make someone else an owner first.
+
+The screen only offers what you may do. The rules live in `UserPolicy` (`ban`, `unban`,
+`setRole`) and `UserAdminService` checks them, so code calling the service gets the same
+answers if it passes the acting staff member:
+
+```php
+$service->setRole($user, Role::Moderator, actor: $request->user());
+$service->ban($user, actor: $request->user());
+```
+
+With no `actor`, the service applies the change without the staff rules. That's for app
+code and the console, where whoever calls is already trusted. The last-owner rule holds
+either way.
+
+Each method also takes an optional `reason`. A ban, unban or role change made by an actor is
+recorded through trove's `StaffActionsInterface` (`usarrs.user.banned`, `usarrs.user.unbanned`,
+`usarrs.user.role_changed`), with the status or role before and after. So is revoking someone
+else's invite (`usarrs.invite.revoked`). With no store installed, the record goes nowhere.
+
+**Invites** follow the same rule: an invite is revoked by its creator, or by anyone who could
+manage the creator. So only an owner revokes an admin's or an owner's invite.
+
+### Setting the first owner
+
+Only an owner grants Admin, so a tracker without one can never make another admin. Set the
+first from the console:
+
+```bash
+php artisan usarrs:owner you@example.com
+```
+
+Further owners are made from the user screen.
+
 ## Invites
 
 ```php
