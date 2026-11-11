@@ -49,6 +49,8 @@ class ConfirmOAuthLink extends Component
     #[Locked]
     public string $token = '';
 
+    public bool $remember = false;
+
     public function mount(string $provider, string $token): void
     {
         abort_unless(in_array($provider, config('usarrs.socialite_providers', []), true), 404);
@@ -85,10 +87,7 @@ class ConfirmOAuthLink extends Component
         // and since 8.1 every account it makes is connected as it's made.
         // Accounts from before 8.1 were made unverified with no stored
         // connection; their owners keep what they set up (CP #776).
-        $strip = $unproven && SocialAccount::query()
-            ->where('user_id', $user->getKey())
-            ->where(fn ($q) => $q->where('provider', '!=', $this->provider)->orWhere('provider_user_id', '!=', $pending['provider_user_id']))
-            ->exists();
+        $strip = $unproven && $this->holdsOtherConnections($user, $pending['provider_user_id']);
 
         if ($existing !== null && $existing->user_id !== $user->getKey()) {
             $this->addError('token', __('That :provider account is already connected to a different account.', ['provider' => $name]));
@@ -137,7 +136,20 @@ class ConfirmOAuthLink extends Component
             return;
         }
 
-        $this->redirect(app(LoginCompletion::class)->begin($user, remember: true), navigate: false);
+        // Asked here, of the inbox owner signing in. Whoever started the round
+        // trip may not be them (Job #355; it used to be always on, #10858).
+        $this->redirect(app(LoginCompletion::class)->begin($user, remember: $this->remember), navigate: false);
+    }
+
+    /**
+     * Does the account hold a connection other than the one being confirmed?
+     */
+    private function holdsOtherConnections(Authenticatable $user, string $providerUserId): bool
+    {
+        return SocialAccount::query()
+            ->where('user_id', $user->getKey())
+            ->where(fn ($q) => $q->where('provider', '!=', $this->provider)->orWhere('provider_user_id', '!=', $providerUserId))
+            ->exists();
     }
 
     /**
@@ -188,9 +200,15 @@ class ConfirmOAuthLink extends Component
 
     public function render(): View
     {
+        $pending = Cache::get(self::CACHE_PREFIX.$this->token);
+        $user = is_array($pending) ? config('trove.user_model', 'App\\Models\\User')::find($pending['user']) : null;
+
         return $this->usarrsView('usarrs::auth.confirm-oauth-link', [
-            'pending' => Cache::get(self::CACHE_PREFIX.$this->token),
+            'pending' => $pending,
             'providerName' => ucfirst($this->provider),
+            // Say so before connect() strips the account (#10880): its owner
+            // loses any 2FA, passkeys and connections they set up, too.
+            'strips' => $user !== null && self::unproven($user) && $this->holdsOtherConnections($user, $pending['provider_user_id']),
         ]);
     }
 }

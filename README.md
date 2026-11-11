@@ -151,12 +151,37 @@ reporting someone's email address does not make you that someone.
 | the identity is connected to an account | signed in to that account — through the two-factor challenge if they have 2FA on |
 | it isn't connected, but its email matches an account here (ignoring case) | nobody is signed in. That account's own address is emailed a link, valid 60 minutes and good once. The email and the page it opens name the provider account; nothing is connected until the holder presses **Connect** there, which then signs them in (2FA applies). Opening the link alone — or a mail scanner opening it — does nothing |
 | it isn't connected and matches no account | an account is created **only if registration is open** — the same rules as `/register`, including required invites — then it's sent the verification email and signed in. Where registration is closed, the visitor gets the same answer whether or not the address has an account, so the callback can't be used to probe which addresses exist |
-| they're already signed in | the identity is connected to *their* account. One that's connected to someone else is refused; they are never switched into another account |
+| they're already signed in, and started a connection from their profile | the identity is connected to *their* account, and they're mailed a notice. Starting one takes a confirmed step-up (see [Confirming it's you](#confirming-its-you)). One connected to someone else is refused; they are never switched into another account |
+| they're already signed in, and didn't start a connection | nothing is connected. A sign-in button pressed while signed in, or a round trip another page started, is refused |
+| they're signed in and started a confirmation | the session is confirmed if the identity is connected to *them*, and nothing is connected either way |
 
-**Invites with OAuth:** there's no registration form under this driver, so send the
-invite through the redirect — `/auth/github/redirect?invite=CODE`. An invite is
-claimed in the same transaction that creates the account, so two sign-ups racing on
-one invite get one account between them.
+**Connected accounts.** Under socialite the profile page lists the member's connected
+providers (`Profile\ConnectedAccounts`, `<livewire:usarrs-connected-accounts />` to embed it in
+your own page), with **Connect** for the configured providers they haven't connected and
+**Remove** for the rest. Both take a confirmed step-up, and both mail the member a notice.
+Removing is refused when it would leave no way in: the only connection, with no passkey.
+
+| Route name | Path | Purpose |
+|---|---|---|
+| `socialite.redirect` | `GET\|POST /auth/{provider}/redirect` | Sign in or up. Only a POST brings an invite or a remember-me choice |
+| `socialite.callback` | `GET /auth/{provider}/callback` | The provider's return |
+| `socialite.connect` | `POST /auth/{provider}/connect` | Connect a provider to the signed-in account (step-up first) |
+| `socialite.confirm` | `POST /auth/{provider}/confirm` | Confirm it's you by signing in again with a connected provider |
+| `socialite.link.confirm` | `GET /auth/{provider}/link/{token}` | The emailed "connect this account?" page (signed) |
+
+**Invites with OAuth:** `/register` has no password form under this driver. It's the
+invite's landing page: the invite email's `/register?invite=CODE` link opens it, with
+the code filled in (or a field to type one, where invites are required) and a
+**Continue with &lt;provider&gt;** button for each provider. The invite travels with that
+button's POST, the only way one reaches the callback. A `GET /auth/{provider}/redirect`
+ignores `?invite=`, because a GET can be started by any page, which could plant its own
+invite in a visitor's sign-up. An invite is claimed in the same transaction that creates
+the account, so two sign-ups racing on one invite get one account between them.
+
+**Remember me** is a checkbox beside the provider buttons, off by default as on the
+password form. It rides the round trip. The emailed connection link below asks it again on
+its own page, of the inbox owner. Under `magic_link` the login form's checkbox rides the
+emailed sign-in link.
 
 **Connecting proves the address.** An account made by OAuth starts unverified: a
 provider *reporting* an address isn't proof of owning it. So someone could make an
@@ -214,7 +239,8 @@ as they would in a stock Laravel app:
 | `verification.notice` | `GET /email/verify` | "Check your email" prompt |
 | `verification.verify` | `GET /email/verify/{id}/{hash}` | The signed link from the verification email |
 | `verification.send` | `POST /email/verification-notification` | Resend the verification email |
-| `password.confirm` | `GET /user/confirm-password` | Re-enter your password before a sensitive action |
+| `password.confirm` | `GET /user/confirm-password` | Confirm it's you before a sensitive action (see below) |
+| `password.confirm.email` | `GET /user/confirm-password/email/{token}` | The emailed "confirm it's you" page (signed) |
 
 **Your `User` model needs `implements \Illuminate\Contracts\Auth\MustVerifyEmail`
 to use email verification** — not just the trait. This trips people up: Laravel's own
@@ -249,14 +275,43 @@ account back. So by default an unverified account can't:
 | Add a passkey | `verified` middleware on `/user/passkeys/options` and `POST /user/passkeys` |
 | Turn on two-factor authentication | `TwoFactorSetup` (enable and confirm) |
 | Connect an OAuth provider while signed in | the OAuth callback |
+| Confirm it's you by email | the confirm page doesn't offer it, and refuses to send |
 | Create an invite | `/invites/create` redirects to `verification.notice`; the action refuses too |
 | Get an announce key | the Generate/Regenerate action. bloodhound also holds the key back at sign-up and issues it on verification |
 
 An app whose `User` doesn't implement `MustVerifyEmail` has opted out of
 verification, and none of these checks apply to it.
 
-Password confirmation needs no opt-in trait — it works against any authenticated user
-out of the box.
+### Confirming it's you
+
+`password.confirm` is Laravel's stock middleware and works as it does anywhere: it sends a
+session that hasn't confirmed recently (`auth.password_timeout`, 3 hours by default) to
+`/user/confirm-password` and brings it back afterwards. It needs no opt-in trait. The page
+offers whatever the member actually has, because under `socialite` an account's password is
+random and unknown, and under `magic_link` the member never chose one:
+
+| Way to confirm | Offered when |
+|---|---|
+| Their password | the driver signs in with passwords (`password`, `invite_only`). Under the others a password doesn't confirm, even one set from the profile |
+| Signing in again with a connected provider | `socialite`, for each provider connected to the member. The returning identity must be connected to *them* |
+| A passkey | passkeys are enabled and the member has one |
+| A link to their email address | always, once the address is verified. The link opens a page naming the browser that asked; approving there confirms that session, once, from any device. Opening the link approves nothing, so mail scanners can't |
+
+usarrs asks for it before adding or removing a passkey, turning two-factor on or off,
+seeing or regenerating recovery codes, connecting or removing an OAuth provider, and
+changing the email address or password on `/profile/edit`. Put `password.confirm` on your
+own sensitive routes the same way.
+
+A magic-link sign-in verifies the address it was sent to, as a verification link does. An
+unverified member who has nothing else to confirm with is pointed to verify first.
+
+**The emailed confirmation can be phished.** A session that isn't the member's can ask for
+one, and the link lands in the owner's real inbox. The page it opens names the browser that
+asked, and says not to approve if that wasn't them.
+
+**There's no "sign out my other sessions" yet** (#11154). A member who gets a confirmation
+link or connection notice they didn't ask for should tell staff. A password change under
+the `password` driver signs out every other session.
 
 Both are part of the auth surface [manage_auth](#manage_auth-escape-hatch) governs —
 absent entirely when `manage_auth=false`, same as login/register/2FA/passkey.
@@ -280,6 +335,11 @@ model needs `Laravel\Fortify\TwoFactorAuthenticatable`.
 | Password login | 5 a minute | email (case-folded) and IP |
 | Two-factor challenge | 5 a minute, codes and recovery codes together | the pending login |
 | Password confirmation | 5 a minute | the signed-in user |
+| "Confirm it's you" email | 1 a minute | the signed-in user |
+| OAuth "connect this account?" email | 3 an hour; the visitor's answer doesn't change | the account it's sent to |
+
+The connection-email limit is per account, so anyone with a provider account reporting a
+member's address can use it up and hold back the member's own link for up to an hour.
 
 Each attempt is counted before the answer is checked, as an atomic increment.
 Checking first and counting only failures would let a burst of parallel
@@ -536,6 +596,31 @@ somewhere else and is refused by the tracker's location limits while its old ses
 still live. The tracker decides what ending costs (bloodhound credits nothing the old
 session moved since its last announce) and refuses to end another member's. With no such
 tracker the route exists and answers 404, and nothing links to it.
+
+## Upgrading from 9.x to 10.0
+
+10.0 makes confirming it's you work for every member, and hardens OAuth around it. Most of
+it needs nothing from you. Check these:
+
+1. **Published views.** If you published `usarrs::auth.password-confirm`,
+   `usarrs::auth.login` or `usarrs::auth.register`, republish them
+   (`php artisan vendor:publish --tag=usarrs-views --force`, then reapply your changes).
+   The confirm page now offers more than a password, and the provider buttons are a POST
+   form (`usarrs::auth.partials.oauth-start`). An old copy of the confirm page leaves
+   socialite and magic-link members at the dead end 10.0 fixes.
+2. **Your own links into OAuth.** A link to `socialite.redirect` with `?invite=` no longer
+   carries the invite: send invitees to `/register?invite=CODE`, which is what the invite
+   email does. A link meant to connect a provider for a signed-in member needs to go to the
+   profile, or POST to `socialite.connect`. The callback no longer connects anything a
+   member didn't start there.
+3. **Remember-me is off by default** on OAuth and magic-link sign-ins, as it always was on
+   the password form. Members who don't tick the box sign in again when their session ends.
+4. **Queued mail.** The OAuth connection link, the "confirm it's you" link and the
+   connection notices are queued notifications. Run a queue worker, or use the `sync`
+   queue connection.
+5. **Step-ups.** Changing the email or password on `/profile/edit`, and connecting or
+   removing an OAuth provider, now ask the member to confirm it's them first. A password no
+   longer counts as that confirmation under `magic_link` or `socialite`.
 
 ## Requirements
 

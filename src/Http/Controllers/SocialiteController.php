@@ -11,16 +11,19 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Str;
 use Marque\Usarrs\Auth\LoginCompletion;
 use Marque\Usarrs\Auth\NewAccount;
 use Marque\Usarrs\Auth\OAuthIdentity;
 use Marque\Usarrs\Auth\RegistrationRules;
+use Marque\Usarrs\Auth\StepUp;
 use Marque\Usarrs\Contracts\OAuthProvider;
 use Marque\Usarrs\Exceptions\InviteAlreadyRedeemed;
 use Marque\Usarrs\Livewire\Auth\ConfirmOAuthLink;
 use Marque\Usarrs\Models\SocialAccount;
+use Marque\Usarrs\Notifications\OAuthConnectionNotice;
 use Marque\Usarrs\Notifications\OAuthLinkConfirmation;
 use Marque\Usarrs\Services\InviteService;
 use Symfony\Component\HttpFoundation\RedirectResponse as SymfonyRedirect;
@@ -37,11 +40,59 @@ class SocialiteController
     {
         $this->validateProvider($provider);
 
-        // There is no registration form under socialite mode to type an invite
-        // into, so it rides the round trip: /auth/github/redirect?invite=CODE.
-        // Anything but a string (?invite[]=x) is no invite, not a TypeError.
-        $invite = $request->query('invite');
-        session()->put('usarrs.oauth.invite', is_string($invite) ? $invite : null);
+        // An invite and the remember-me choice ride the round trip, and only
+        // from a POST: the form on /register (the invite email's link) or the
+        // login page, which CSRF protection ties to this site. A GET used to
+        // take ?invite=, so any page could start a round trip carrying an
+        // attacker's invite, and an auto-approving provider made the visitor's
+        // account on it (#10858). A GET is a bare sign-in.
+        // Anything but a string (invite[]=x) is no invite, not a TypeError.
+        $invite = $request->isMethod('post') ? $request->input('invite') : null;
+        session()->put('usarrs.oauth.invite', is_string($invite) && $invite !== '' ? $invite : null);
+        session()->put('usarrs.oauth.remember', $request->isMethod('post') && $request->boolean('remember'));
+
+        // A sign-in round trip is never a connection or a confirmation, even
+        // if one of those was started and abandoned at the provider: its
+        // intent would otherwise still be waiting for this callback.
+        session()->forget('usarrs.oauth.intent');
+
+        return $this->oauth->redirect($provider);
+    }
+
+    /**
+     * Start a round trip that confirms it's you (Job #355): the step-up a
+     * socialite member has, since their password is random and unknown. The
+     * callback reads the intent and accepts only an identity already linked to
+     * the signed-in member; see confirmCurrentUser().
+     */
+    public function confirm(string $provider): SymfonyRedirect
+    {
+        $this->validateProvider($provider);
+
+        session()->put('usarrs.oauth.intent', 'confirm');
+
+        return $this->oauth->redirect($provider);
+    }
+
+    /**
+     * Start a round trip that connects a provider to the signed-in member
+     * (#10858). It used to take nothing but a signed-in session: a stolen one
+     * could connect the thief's provider and keep a way in after the owner
+     * took the account back. Now it takes a confirmed step-up, and an
+     * unconfirmed member is sent to confirm and brought back to the profile to
+     * start again (a POST can't be redirected back to).
+     */
+    public function connect(string $provider): SymfonyRedirect
+    {
+        $this->validateProvider($provider);
+
+        if (! StepUp::recent()) {
+            session()->put('url.intended', route('profile.show'));
+
+            return redirect()->route('password.confirm');
+        }
+
+        session()->put('usarrs.oauth.intent', 'connect');
 
         return $this->oauth->redirect($provider);
     }
@@ -61,24 +112,57 @@ class SocialiteController
 
         $identity = $this->oauth->user($provider);
 
+        // An empty id would be a linkable identity that every empty-id sign-in
+        // matches (#10880).
+        if ($identity->id === '') {
+            return $this->refuse(__(':provider didn\'t say which account this is. Try again.', ['provider' => ucfirst($provider)]));
+        }
+
+        // Read once, whoever comes back: a round trip started to confirm must
+        // not leave the next one confirming.
+        $intent = session()->pull('usarrs.oauth.intent');
+
+        // Off unless the member ticked the box: every OAuth sign-in used to set
+        // a long-lived remember cookie (#10858).
+        $remember = (bool) session()->pull('usarrs.oauth.remember', false);
+
+        if ($intent === 'confirm' && auth()->check()) {
+            return $this->confirmCurrentUser($identity);
+        }
+
         // Signed in already: this is connecting a provider to *this* account,
         // never a login. It used to be treated as one — an identity linked to
-        // someone else switched the user into that account (Spec #142).
+        // someone else switched the user into that account (Spec #142). And it
+        // connected whatever came back, with no step-up (#10858): now only a
+        // round trip started by connect(), still confirmed.
         if (auth()->check()) {
+            if ($intent !== 'connect') {
+                return redirect()->route('profile.show')
+                    ->withErrors(['email' => __('To connect :provider, start from your profile.', ['provider' => ucfirst($provider)])]);
+            }
+
+            if (! StepUp::recent()) {
+                session()->put('url.intended', route('profile.show'));
+
+                return redirect()->route('password.confirm');
+            }
+
             return $this->connectToCurrentUser($identity);
         }
 
         $link = SocialAccount::resolve($identity->provider, $identity->id);
 
         if ($link !== null) {
-            return redirect(app(LoginCompletion::class)->begin($link->user, remember: true));
+            return redirect(app(LoginCompletion::class)->begin($link->user, $remember));
         }
 
         // Not linked to anyone. Never sign in on the email — that is the
         // takeover. If it matches an account, ask that account's own inbox.
         $inviteCode = session()->pull('usarrs.oauth.invite');
 
-        if ($identity->email === null) {
+        // An address longer than the column can't be stored, and no real one is
+        // (RFC 5321 caps a path at 254); taken as no address (#10880).
+        if ($identity->email === null || mb_strlen($identity->email) > 255) {
             return $this->refuse(__(':provider didn\'t share an email address, so an account can\'t be made from it.', ['provider' => ucfirst($provider)]));
         }
 
@@ -101,7 +185,7 @@ class SocialiteController
             return redirect()->route('login')->with('status', __('That :provider account isn\'t connected here yet.', ['provider' => ucfirst($provider)]).' '.$sentLink);
         }
 
-        return $this->register($identity, $inviteCode);
+        return $this->register($identity, $inviteCode, $remember);
     }
 
     /**
@@ -114,14 +198,16 @@ class SocialiteController
      * CP #763): an invite lost to a concurrent request, or the same identity
      * linked by one, leaves no account behind and no error page.
      */
-    private function register(OAuthIdentity $identity, ?string $inviteCode): RedirectResponse
+    private function register(OAuthIdentity $identity, ?string $inviteCode, bool $remember): RedirectResponse
     {
         $invite = $this->rules->validInvite($inviteCode);
 
         try {
             $user = DB::transaction(function () use ($identity, $invite) {
                 $user = $this->userModel()::create([
-                    'name' => $identity->name ?? $identity->nickname ?? $identity->email,
+                    // The provider's name, cut to the column: a longer one
+                    // was a 500 under MySQL strict mode (#10880).
+                    'name' => mb_substr((string) ($identity->name ?? $identity->nickname ?? $identity->email), 0, 255),
                     'email' => $identity->email,
                     // Nobody knows it and nothing can reset it under socialite
                     // mode: this account is reached through its OAuth link only.
@@ -143,14 +229,19 @@ class SocialiteController
         } catch (InviteAlreadyRedeemed) {
             return $this->refuse(__('That invite has already been used.'));
         } catch (UniqueConstraintViolationException) {
-            return $this->refuse(__('That :provider account was connected moments ago — try signing in again.', ['provider' => ucfirst($identity->provider)]));
+            // Either the identity was linked meanwhile, or another sign-up took
+            // the address. Saying which is safe: registration is open here, and
+            // /register says an address is taken anyway (#10880).
+            return SocialAccount::resolve($identity->provider, $identity->id) !== null
+                ? $this->refuse(__('That :provider account was connected moments ago — try signing in again.', ['provider' => ucfirst($identity->provider)]))
+                : $this->refuse(__('An account with that email address was made moments ago. Sign in to it instead.'));
         }
 
         // Unverified, like any other new account. The provider's say-so is not
         // this site's proof that the address is theirs.
         NewAccount::announce($user);
 
-        return redirect(app(LoginCompletion::class)->begin($user, remember: true));
+        return redirect(app(LoginCompletion::class)->begin($user, $remember));
     }
 
     /**
@@ -174,6 +265,13 @@ class SocialiteController
         // Except where nobody has proven the address: that connection may be a
         // squatter's, and confirming drops it (ConfirmOAuthLink::stripUnprovenAccount()).
         if ($alreadyHasOne && ! ConfirmOAuthLink::unproven($holder)) {
+            return;
+        }
+
+        // Three an hour per account: each callback carrying the address sent a
+        // mail, so anyone could fill an inbox (#10880). The visitor's answer
+        // doesn't change, or it would say the address has an account.
+        if (RateLimiter::hit('usarrs.oauth-link-mail:'.$holder->getAuthIdentifier(), 3600) > 3) {
             return;
         }
 
@@ -247,7 +345,31 @@ class SocialiteController
                 : redirect()->route('profile.show')->withErrors(['email' => __('That :provider account is already connected to a different account.', ['provider' => $provider])]);
         }
 
+        // Told by mail, so an owner learns of a connection they didn't make
+        // even if the session that made it isn't theirs (#10858).
+        $user->notify(new OAuthConnectionNotice($identity->provider, connected: true, label: $identity->label()));
+
         return redirect()->route('profile.show')->with('status', __(':provider connected.', ['provider' => $provider]));
+    }
+
+    /**
+     * Mark the session confirmed if this identity is linked to the signed-in
+     * member, and to nobody else (Job #355). A stolen session's browser is
+     * signed in to the thief's provider account, not the owner's. Nothing is
+     * connected here, whatever comes back.
+     */
+    private function confirmCurrentUser(OAuthIdentity $identity): RedirectResponse
+    {
+        $link = SocialAccount::resolve($identity->provider, $identity->id);
+
+        if ($link === null || (string) $link->user_id !== (string) auth()->id()) {
+            return redirect()->route('password.confirm')
+                ->withErrors(['provider' => __('That :provider account isn\'t connected to yours. Confirm with the one that is, or another way.', ['provider' => ucfirst($identity->provider)])]);
+        }
+
+        session()->passwordConfirmed();
+
+        return redirect()->intended(LoginCompletion::home());
     }
 
     private function refuse(string $message): RedirectResponse

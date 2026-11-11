@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Marque\Usarrs\Livewire\Auth;
 
 use Illuminate\Contracts\View\View;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Livewire\Attributes\Title;
@@ -48,8 +49,14 @@ class Register extends Component
 
         // Under invite_only the form opens only for someone holding a usable
         // invite. It used to 404 before the code was even read (#10801).
+        // Under socialite it's the invite email's landing page: no password
+        // form, just the providers, posting the invite along (#10858). It used
+        // to 404, so the email's own link was dead and the only way in was a
+        // GET carrying ?invite=, which any page could plant. register() still
+        // refuses under socialite: accounts come from the OAuth callback.
         abort_unless(
             $this->driver()->allowsPasswordRegistration()
+                || $this->driver() === AuthDriver::Socialite
                 || ($this->driver()->requiresInvite() && $rules->validInvite($this->invite) !== null),
             404,
         );
@@ -94,6 +101,12 @@ class Register extends Component
             $this->addError('invite', __('That invite has already been used.'));
 
             return;
+        } catch (UniqueConstraintViolationException) {
+            // Another registration took the address between the rule and the
+            // insert: a 500 before (#10880).
+            $this->addError('email', __('That email address was registered moments ago.'));
+
+            return;
         }
 
         NewAccount::announce($user);
@@ -110,6 +123,7 @@ class Register extends Component
     {
         return $this->usarrsView('usarrs::auth.register', [
             'inviteRequired' => app(RegistrationRules::class)->inviteRequired(),
+            'viaOAuth' => $this->driver() === AuthDriver::Socialite,
         ]);
     }
 }

@@ -7,6 +7,123 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [10.0.0] — 2026-11-11
+
+> Confirming it's you works for every member, whatever the auth driver; connecting an OAuth provider takes it and tells the member; connections can be listed and removed; remember-me is a choice; invites can't be planted.
+
+### Breaking
+
+See [Upgrading from 9.x to 10.0](README.md#upgrading-from-9x-to-100).
+
+- **Remember-me is off unless the member ticks the box.** OAuth sign-ins and sign-ups, the
+  emailed connection link and magic links all used to remember. Members on those drivers
+  will be asked to sign in again when their session ends.
+- **A signed-in member's OAuth round trip connects nothing unless they started it from the
+  profile** (`POST socialite.connect`, after a step-up). A link or button of your own that
+  sent signed-in members to `socialite.redirect` to connect a provider now gets them an
+  error. Point it at the profile, or POST to `socialite.connect`.
+- **`?invite=` on `GET socialite.redirect` is ignored.** The README told operators to send
+  invitees there. Send them to `/register?invite=CODE` (the invite email already does).
+- **Two-factor setup takes a confirmed step-up** (Job #355's independent check). Turning
+  it on or off and regenerating recovery codes took none, and the codes were shown to any
+  session. A session that wasn't the member's could disable two-factor, read the codes, or
+  turn it on with its own authenticator and lock the owner out. The codes now show only
+  after a recent confirmation.
+- **An abandoned connection can't be finished by another round trip.** A connect given up
+  at the provider left its intent in the session, so a sign-in round trip started within
+  the step-up window (by another page, say) connected whatever came back. Starting any
+  sign-in round trip now clears it.
+- **Removing connections can't leave no way in.** Two removals at once each counted two
+  connections and deleted one. Removals for one member now take turns, under a lock on the
+  member's row, and the count after deleting decides.
+- **A magic-link sign-in verifies the address**, the proof a verification link gives. An
+  unverified member with nothing else to confirm with is told to verify first, instead of
+  being shown an empty confirm page.
+- **The emailed connection link's page asks "Remember me"**, rather than carrying the
+  choice of whoever started the round trip, who may not be the inbox owner.
+- **A password no longer confirms under `magic_link` or `socialite`.**
+- **Changing the email or password on `/profile/edit` takes a confirmed step-up.**
+- **The `usarrs::auth.login` and `usarrs::auth.register` views changed** (the provider
+  buttons are a POST form, from the new `usarrs::auth.partials.oauth-start`; the register
+  view takes `viaOAuth`). An app that published them should republish.
+- **The `usarrs::auth.password-confirm` view takes `offersPassword`, `offersLink`,
+  `linkOut`, `providers` and `passkeyUrls`.** An app that published the view should
+  republish it, or its members on those drivers keep the dead end.
+
+### Fixed
+
+- **Confirming it's you works for members with no password to type** (Job #355). The
+  `password.confirm` page asked only for a password. A socialite member's password is
+  random and unknown, and a magic-link member never chose one. So everything behind
+  `password.confirm` (managing passkeys, for a start) was a dead end for them. The page now
+  offers whatever the member has, and every option ends in the same session mark, so the
+  stock middleware stays the only gate:
+  - **their password**, where a password signs in (`password`, `invite_only`);
+  - **a link to their verified address**, on every driver. The link opens a page naming
+    the browser that asked, and approving there confirms that session only, once, from any
+    device. Opening the link approves nothing, so mail scanners can't. Sent at most once a
+    minute. Not offered to an unverified address;
+  - **signing in again with a provider connected to their account**, under socialite
+    (`POST /auth/{provider}/confirm`, `socialite.confirm`). The callback accepts only an
+    identity linked to the signed-in member, and connects nothing;
+  - **a passkey**, where they have one, through laravel/passkeys' confirm endpoint, which
+    already marked the session confirmed but was never offered.
+- **Connecting a provider while signed in takes a confirmed step-up, and the member is
+  told by mail** (#10858). It took nothing but a signed-in session, so a stolen one could
+  connect the thief's provider and keep a way in after the owner took the account back. A
+  connection now starts from the profile, as a POST to `socialite.connect`
+  (`/auth/{provider}/connect`). An unconfirmed member is sent to confirm and brought back to
+  the profile. Only that round trip's callback connects anything: a signed-in member coming
+  back from any other round trip (the sign-in button, or one another page started) is
+  refused, and so is one whose confirmation lapsed on the way. `OAuthConnectionNotice` mails
+  the member when a provider is connected or removed.
+- **Remember-me is the member's choice on every sign-in** (#10858). Every OAuth sign-in,
+  OAuth sign-up, emailed connection confirmation and magic-link sign-in set a long-lived
+  remember cookie. The login page now has a checkbox under `socialite` and `magic_link`
+  too, off by default as on the password form. It rides the OAuth round trip and the magic
+  link, and the emailed connection link's page asks it of the inbox owner.
+- **An invite reaches an OAuth sign-up only in a POST** (#10858). `GET
+  /auth/{provider}/redirect?invite=CODE` could be started by any page, planting an
+  attacker's invite in a visitor's sign-up: with an auto-approving provider, the visitor's
+  account was made on it, skewing the invite tree. The redirect now also takes a POST
+  (CSRF-protected) carrying `invite` and `remember`. A GET is a bare sign-in, and its
+  `?invite=` is ignored.
+- **The invite email's link works under socialite.** `/register?invite=CODE` returned a
+  404 there, so the only way to use an invite was a hand-made redirect URL. `/register` is
+  now the invite's landing page under socialite: the code (or a field for one), a
+  remember-me box, and a POST button per provider. Its password form stays refused.
+- **Changing the email address, or setting or changing the password, on `/profile/edit`
+  takes a confirmed step-up** (#10880). A session that wasn't the member's could take the
+  account's address, and with it every emailed proof, or set a password that outlived the
+  session. Nothing is saved without the step-up: the member confirms and comes back. A
+  name or bio change needs none.
+- **OAuth hardening from the 8.1.0 reviews** (#10880):
+  - an account is mailed at most three connection links an hour, and the visitor's answer
+    doesn't change when the limit is hit (it would otherwise reveal that the address has an
+    account);
+  - `OAuthLinkConfirmation` is queued, so a callback carrying a known address answers as fast
+    as one carrying an unknown address;
+  - an identity with an empty provider id is refused, since it would have been one identity
+    for every such sign-in;
+  - a provider name longer than the column is cut to 255 characters (it was a 500 under MySQL
+    strict mode), and an email address longer than 255 counts as no address;
+  - two registrations racing on one address get "registered moments ago" on `/register` (it
+    was a 500). An OAuth sign-up that loses the address race is now told that, instead of
+    being told the provider was connected moments ago;
+  - the connection link's page warns, before connecting, when connecting will strip an
+    account whose address was never proven of its other connections, passkeys, two-factor and
+    remembered sign-ins.
+- **A password no longer confirms under `magic_link` or `socialite`.** A password set from
+  the profile there was never a way in, and may be a squatter's (#10880).
+
+### Added
+
+- **Connected accounts on the profile** (#10858), under socialite: `Profile\ConnectedAccounts`
+  (`usarrs-connected-accounts`), on usarrs' profile page and embeddable in an app's own. It
+  lists the member's providers, connects the ones they haven't, and disconnects. Disconnecting
+  takes a confirmed step-up, mails a notice, and is refused when it would remove the last way
+  in (the only connection, with no passkey).
+
 ## [9.0.1] — 2026-11-07
 
 > The admin user screen's subject comes from its URL only.
